@@ -794,9 +794,7 @@ impl PaymentProcessor {
     ) -> Result<PaymentStatus, Error> {
         oracle.require_auth();
 
-        if !AccessControl::has_role(&env, &role_oracle(&env), &oracle)
-            && !AccessControl::has_role(&env, &role_settlement_operator(&env), &oracle)
-        {
+        if !AccessControl::has_role(&env, &role_oracle(&env), &oracle) {
             return Err(Error::Unauthorized);
         }
 
