@@ -32,6 +32,8 @@ pub struct Merchant {
     pub kyc_tier: KycTier,
     pub active: bool,
     pub created_at: u64,
+    pub suspended_at: Option<u64>,
+    pub suspension_reason: Option<String>,
 }
 
 #[contracttype]
@@ -96,6 +98,8 @@ impl MerchantRegistry {
             kyc_tier: KycTier::Unverified,
             active: true,
             created_at: env.ledger().timestamp(),
+            suspended_at: None,
+            suspension_reason: None,
         };
 
         env.storage()
@@ -192,6 +196,75 @@ impl MerchantRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "VERIFIED")),
+            merchant_id,
+        );
+
+        Ok(())
+    }
+
+    /// Suspend a merchant (admin only).
+    pub fn suspend_merchant(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+        reason: String,
+    ) -> Result<(), MerchantError> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
+
+        if admin != stored_admin {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        merchant.suspended_at = Some(env.ledger().timestamp());
+        merchant.suspension_reason = Some(reason);
+
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        env.events().publish(
+            (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "SUSPENDED")),
+            merchant_id,
+        );
+
+        Ok(())
+    }
+
+    /// Reinstate a suspended merchant (admin only).
+    pub fn reinstate_merchant(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+    ) -> Result<(), MerchantError> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
+
+        if admin != stored_admin {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        merchant.suspended_at = None;
+        merchant.suspension_reason = None;
+
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        env.events().publish(
+            (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "REINSTATED")),
             merchant_id,
         );
 

@@ -405,3 +405,121 @@ fn test_verified_merchant_can_create_payment() {
     assert_eq!(payment.merchant_id, merchant);
     assert_eq!(payment.amount, amount);
 }
+
+#[test]
+fn test_suspend_merchant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant_id = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Suspended Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+    );
+
+    let reason = String::from_str(&env, "Fraud activity");
+    client.suspend_merchant(&admin, &merchant_id, &reason);
+
+    let merchant = client.get_merchant(&merchant_id);
+    assert_eq!(merchant.suspension_reason, Some(reason));
+    assert!(merchant.suspended_at.is_some());
+}
+
+#[test]
+fn test_reinstate_merchant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant_id = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Banned Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+    );
+
+    let reason = String::from_str(&env, "Fraud activity");
+    client.suspend_merchant(&admin, &merchant_id, &reason);
+
+    let merchant_suspended = client.get_merchant(&merchant_id);
+    assert!(merchant_suspended.suspended_at.is_some());
+
+    client.reinstate_merchant(&admin, &merchant_id);
+
+    let merchant_reinstated = client.get_merchant(&merchant_id);
+    assert!(merchant_reinstated.suspended_at.is_none());
+    assert!(merchant_reinstated.suspension_reason.is_none());
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #1)")]
+fn test_suspended_merchant_cannot_create_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payment_processor = env.register(PaymentProcessor, ());
+    let refund_manager = env.register(RefundManager, ());
+    let merchant_registry = env.register(MerchantRegistry, ());
+
+    let payment_client = PaymentProcessorClient::new(&env, &payment_processor);
+    let refund_client = RefundManagerClient::new(&env, &refund_manager);
+    let merchant_client = MerchantRegistryClient::new(&env, &merchant_registry);
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let usdc_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    refund_client.initialize_refund_manager(&admin, &usdc_token);
+    payment_client.initialize_payment_processor(&admin);
+    merchant_client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    merchant_client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "Verified Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+    );
+    merchant_client.verify_merchant(&admin, &merchant);
+
+    payment_client.set_merchant_registry_address(&admin, &merchant_registry);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    merchant_client.suspend_merchant(&admin, &merchant, &String::from_str(&env, "Fraud"));
+
+    let payment_id = String::from_str(&env, "PAY_01");
+    let amount = 1000i128;
+    let expires_at = env.ledger().timestamp() + 3600;
+
+    payment_client.create_payment(
+        &payment_id,
+        &merchant,
+        &amount,
+        &Symbol::new(&env, "USDC"),
+        &Address::generate(&env),
+        &expires_at,
+        &None::<String>,
+        &None::<String>,
+    );
+}
