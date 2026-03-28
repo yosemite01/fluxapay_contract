@@ -638,10 +638,20 @@
               },
               {
                 "symbol": "CREATED"
+              },
+              {
+                "string": "payment_123"
               }
             ],
             "data": {
-              "string": "payment_123"
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "i128": "1000000000"
+                }
+              ]
             }
           }
         }

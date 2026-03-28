@@ -785,15 +785,19 @@ impl PaymentProcessor {
 
         let mut merchant_payments = Self::get_merchant_payments_internal(&env, &merchant_id);
         merchant_payments.push_back(payment_id.clone());
-        let merchant_payments_key = DataKey::MerchantPayments(merchant_id);
+        let merchant_payments_key = DataKey::MerchantPayments(merchant_id.clone());
         env.storage()
             .persistent()
             .set(&merchant_payments_key, &merchant_payments);
         Self::bump_ttl(&env, &merchant_payments_key, LONG_LIVE_TTL);
 
         env.events().publish(
-            (Symbol::new(&env, "PAYMENT"), Symbol::new(&env, "CREATED")),
-            payment_id,
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "CREATED"),
+                payment_id.clone(),
+            ),
+            (merchant_id, amount),
         );
 
         Ok(payment)
@@ -861,8 +865,12 @@ impl PaymentProcessor {
         };
 
         env.events().publish(
-            (Symbol::new(&env, "PAYMENT"), event_name),
-            (payment_id, amount_received),
+            (
+                Symbol::new(&env, "PAYMENT"),
+                event_name,
+                payment_id.clone(),
+            ),
+            (payment.merchant_id, payment.amount, amount_received),
         );
 
         Ok(new_status)
@@ -929,8 +937,12 @@ impl PaymentProcessor {
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
         env.events().publish(
-            (Symbol::new(&env, "PAYMENT"), Symbol::new(&env, "CANCELLED")),
-            payment_id,
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "CANCELLED"),
+                payment_id.clone(),
+            ),
+            (payment.merchant_id, payment.amount),
         );
 
         Ok(())
@@ -956,8 +968,12 @@ impl PaymentProcessor {
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
         env.events().publish(
-            (Symbol::new(&env, "PAYMENT"), Symbol::new(&env, "EXPIRED")),
-            payment_id,
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "EXPIRED"),
+                payment_id.clone(),
+            ),
+            (payment.merchant_id, payment.amount),
         );
 
         Ok(())
@@ -990,8 +1006,12 @@ impl PaymentProcessor {
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
         env.events().publish(
-            (Symbol::new(&env, "PAYMENT"), Symbol::new(&env, "SETTLED")),
-            payment_id,
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "SETTLED"),
+                payment_id.clone(),
+            ),
+            (payment.merchant_id, payment.amount),
         );
 
         Ok(())
