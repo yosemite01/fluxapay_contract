@@ -113,7 +113,7 @@
                   "string": "payment_memo_persist"
                 },
                 {
-                  "bytes": "218efa021e174ae9f1d9e39f69a83b70a2e84cb078c7b9f90a111891919da3da"
+                  "bytes": "9628f11e9968c59df2d1f3efa22707eef0964e163baa5edc2e6d15779de4c143"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -417,7 +417,7 @@
                         "symbol": "transaction_hash"
                       },
                       "val": {
-                        "bytes": "218efa021e174ae9f1d9e39f69a83b70a2e84cb078c7b9f90a111891919da3da"
+                        "bytes": "9628f11e9968c59df2d1f3efa22707eef0964e163baa5edc2e6d15779de4c143"
                       }
                     }
                   ]

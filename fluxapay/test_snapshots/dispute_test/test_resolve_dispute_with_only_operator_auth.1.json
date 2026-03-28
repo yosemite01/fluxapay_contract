@@ -177,7 +177,7 @@
                   "string": "pay_auth_test"
                 },
                 {
-                  "bytes": "8b88f2f7e741a889b6a6d0a971bcbe9447dea650664dd4b5de4a7c5ef95d53f1"
+                  "bytes": "972df06dd5060eab9f7c8d1f5f05a2a43f9601e33993d4bb7024f029e942f869"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
@@ -596,7 +596,7 @@
                         "symbol": "transaction_hash"
                       },
                       "val": {
-                        "bytes": "8b88f2f7e741a889b6a6d0a971bcbe9447dea650664dd4b5de4a7c5ef95d53f1"
+                        "bytes": "972df06dd5060eab9f7c8d1f5f05a2a43f9601e33993d4bb7024f029e942f869"
                       }
                     }
                   ]
@@ -1286,7 +1286,7 @@
                       "val": {
                         "vec": [
                           {
-                            "symbol": "Pending"
+                            "symbol": "Confirmed"
                           }
                         ]
                       }
@@ -1303,7 +1303,7 @@
             },
             "ext": "v0"
           },
-          120960
+          6311999
         ]
       ],
       [

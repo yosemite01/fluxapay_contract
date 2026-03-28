@@ -177,7 +177,7 @@
                   "string": "payment_003"
                 },
                 {
-                  "bytes": "ee92f8f82b0d9078efd4d9a5c71e5c0788b378975a48a03104426cfef56c1114"
+                  "bytes": "0c42aaa9162befa178570f578112b24ad0eaf7a0a05628d61392a5e2f97caf8d"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
@@ -596,7 +596,7 @@
                         "symbol": "transaction_hash"
                       },
                       "val": {
-                        "bytes": "ee92f8f82b0d9078efd4d9a5c71e5c0788b378975a48a03104426cfef56c1114"
+                        "bytes": "0c42aaa9162befa178570f578112b24ad0eaf7a0a05628d61392a5e2f97caf8d"
                       }
                     }
                   ]
@@ -1286,7 +1286,7 @@
                       "val": {
                         "vec": [
                           {
-                            "symbol": "Pending"
+                            "symbol": "Confirmed"
                           }
                         ]
                       }
@@ -1303,7 +1303,7 @@
             },
             "ext": "v0"
           },
-          120960
+          6311999
         ]
       ],
       [
