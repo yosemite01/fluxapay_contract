@@ -24,6 +24,10 @@ pub struct PaymentLinkManager;
 
 #[contractimpl]
 impl PaymentLinkManager {
+    pub fn version() -> u32 {
+        1
+    }
+
     pub fn create_link(
         env: Env,
         merchant: Address,

@@ -55,6 +55,10 @@ pub enum MerchantError {
 
 #[contractimpl]
 impl MerchantRegistry {
+    pub fn version() -> u32 {
+        1
+    }
+
     /// Initialize the contract with an admin address
     pub fn initialize(env: Env, admin: Address) -> Result<(), MerchantError> {
         if env.storage().persistent().has(&MerchantDataKey::Admin) {

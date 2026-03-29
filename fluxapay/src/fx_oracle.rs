@@ -30,6 +30,10 @@ pub enum OracleDataKey {
 
 #[contractimpl]
 impl FXOracle {
+    pub fn version() -> u32 {
+        1
+    }
+
     pub fn oracle_initialize(env: Env, admin: Address, staleness_threshold: u64) {
         AccessControl::initialize(&env, admin);
         env.storage()

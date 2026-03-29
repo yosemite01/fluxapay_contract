@@ -159,6 +159,10 @@ const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
 
 #[contractimpl]
 impl RefundManager {
+    pub fn version() -> u32 {
+        1
+    }
+
     pub fn initialize_refund_manager(env: Env, admin: Address, usdc_token_address: Address) {
         AccessControl::initialize(&env, admin);
         env.storage()
@@ -271,10 +275,10 @@ impl RefundManager {
 
         // Validate refund amount does not exceed original payment amount
         // First try to get payment from local storage
-        let payment: PaymentCharge = if let Some(local_payment) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id.clone()))
+        let payment: PaymentCharge = if let Some(local_payment) =
+            env.storage()
+                .persistent()
+                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id.clone()))
         {
             local_payment
         } else {
@@ -808,6 +812,10 @@ impl RefundManager {
 
 #[contractimpl]
 impl PaymentProcessor {
+    pub fn version() -> u32 {
+        1
+    }
+
     pub fn initialize_payment_processor(env: Env, admin: Address) {
         AccessControl::initialize(&env, admin);
         // Initialize paused state to false
@@ -889,14 +897,14 @@ impl PaymentProcessor {
         let now = env.ledger().timestamp();
         let key = DataKey::MerchantRateLimit(merchant_id.clone());
 
-        let mut state: MerchantCreateRateLimit = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(MerchantCreateRateLimit {
-                last_payment_at: now,
-                count: 0,
-            });
+        let mut state: MerchantCreateRateLimit =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantCreateRateLimit {
+                    last_payment_at: now,
+                    count: 0,
+                });
 
         if now.saturating_sub(state.last_payment_at) >= CREATE_PAYMENT_WINDOW_SECS {
             state.count = 0;
@@ -941,11 +949,14 @@ impl PaymentProcessor {
             .persistent()
             .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
         {
-            let registry_client = crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
             match registry_client.try_get_merchant(&merchant_id) {
                 Ok(Ok(merchant)) => {
                     // Require merchant to be verified (not Unverified) and active
-                    if merchant.kyc_tier == crate::merchant_registry::KycTier::Unverified || !merchant.active {
+                    if merchant.kyc_tier == crate::merchant_registry::KycTier::Unverified
+                        || !merchant.active
+                    {
                         return Err(Error::Unauthorized);
                     }
                 }
