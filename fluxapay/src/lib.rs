@@ -106,6 +106,10 @@ pub struct Dispute {
     pub created_at: u64,
     pub resolved_at: Option<u64>,
     pub resolution_notes: Option<String>,
+    /// Operator-set deadline (Unix timestamp) by which the dispute must be resolved.
+    pub review_deadline: Option<u64>,
+    /// True when the dispute has been flagged for escalation (e.g. deadline exceeded).
+    pub escalated: bool,
 }
 
 #[contracterror]
@@ -552,6 +556,8 @@ impl RefundManager {
             created_at: env.ledger().timestamp(),
             resolved_at: None,
             resolution_notes: None,
+            review_deadline: None,
+            escalated: false,
         };
 
         env.storage()
@@ -612,6 +618,62 @@ impl RefundManager {
                 Symbol::new(&env, "UNDER_REVIEW"),
             ),
             (dispute.payment_id, dispute_id, dispute.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Operator-only: set or update the review deadline for an open or under-review dispute.
+    /// Emits DISPUTE/DEADLINE_SET. If the current ledger time already exceeds the deadline,
+    /// the dispute is also flagged as escalated and DISPUTE/ESCALATED is emitted.
+    pub fn set_dispute_deadline(
+        env: Env,
+        operator: Address,
+        dispute_id: String,
+        deadline: u64,
+    ) -> Result<(), Error> {
+        operator.require_auth();
+
+        let has_settlement =
+            AccessControl::has_role(&env, &role_settlement_operator(&env), &operator);
+        let has_oracle = AccessControl::has_role(&env, &role_oracle(&env), &operator);
+
+        if !has_settlement && !has_oracle {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        dispute.review_deadline = Some(deadline);
+
+        let now = env.ledger().timestamp();
+        if now > deadline && !dispute.escalated {
+            dispute.escalated = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+            Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+            env.events().publish(
+                (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "ESCALATED")),
+                (dispute.payment_id.clone(), dispute_id.clone(), dispute.amount),
+            );
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+            Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DISPUTE"),
+                Symbol::new(&env, "DEADLINE_SET"),
+            ),
+            (dispute.payment_id, dispute_id, deadline),
         );
 
         Ok(())
