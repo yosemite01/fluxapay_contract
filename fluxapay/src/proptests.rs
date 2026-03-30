@@ -1,8 +1,22 @@
-#![cfg(test)]
-
 use crate::format_id;
 use proptest::prelude::*;
-use soroban_sdk::Env;
+use soroban_sdk::{
+    testutils::{Address as _, BytesN as _, Ledger as _},
+    Address, BytesN, Env, String, Symbol,
+};
+
+use crate::{
+    access_control::{role_merchant, role_oracle},
+    Error, PaymentProcessor, PaymentProcessorClient, PaymentStatus, PAYMENT_TOLERANCE,
+};
+
+fn setup_payment_processor(env: &Env) -> (Address, PaymentProcessorClient<'_>) {
+    let contract_id = env.register(PaymentProcessor, ());
+    let client = PaymentProcessorClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    client.initialize_payment_processor(&admin);
+    (admin, client)
+}
 
 proptest! {
     #[test]
@@ -46,5 +60,98 @@ proptest! {
         let parsed_n: u64 = num_part.parse().unwrap();
 
         assert_eq!(n, parsed_n);
+    }
+
+    #[test]
+    fn test_verify_payment_fails_after_expiry(
+        expires_in in 1u64..300u64,
+        after_expiry in 1u64..300u64,
+        amount in 1i128..1_000_000i128,
+        nonce in 0u64..u64::MAX,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = setup_payment_processor(&env);
+
+        let merchant = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.grant_role(&admin, &role_merchant(&env), &merchant);
+        client.grant_role(&admin, &role_oracle(&env), &oracle);
+
+        let payment_id = format_id(&env, "exp_prop_", nonce);
+        let expires_at = env.ledger().timestamp() + expires_in;
+
+        client.create_payment(
+            &payment_id,
+            &merchant,
+            &amount,
+            &Symbol::new(&env, "USDC"),
+            &Address::generate(&env),
+            &expires_at,
+            &None::<String>,
+            &None::<String>,
+        );
+
+        env.ledger().set_timestamp(expires_at + after_expiry);
+
+        let result = client.try_verify_payment(
+            &oracle,
+            &payment_id,
+            &BytesN::<32>::random(&env),
+            &Address::generate(&env),
+            &amount,
+        );
+
+        assert_eq!(result, Err(Ok(Error::PaymentExpired)));
+    }
+
+    #[test]
+    fn test_verify_payment_amount_boundaries(
+        amount in 5i128..1_000_000i128,
+        delta in -200i128..200i128,
+        nonce in 0u64..u64::MAX,
+    ) {
+        prop_assume!(amount + delta > 0);
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = setup_payment_processor(&env);
+
+        let merchant = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.grant_role(&admin, &role_merchant(&env), &merchant);
+        client.grant_role(&admin, &role_oracle(&env), &oracle);
+
+        let payment_id = format_id(&env, "amt_prop_", nonce);
+        let expires_at = env.ledger().timestamp() + 3600;
+
+        client.create_payment(
+            &payment_id,
+            &merchant,
+            &amount,
+            &Symbol::new(&env, "USDC"),
+            &Address::generate(&env),
+            &expires_at,
+            &None::<String>,
+            &None::<String>,
+        );
+
+        let status = client.verify_payment(
+            &oracle,
+            &payment_id,
+            &BytesN::<32>::random(&env),
+            &Address::generate(&env),
+            &(amount + delta),
+        );
+
+        let expected = if delta > PAYMENT_TOLERANCE {
+            PaymentStatus::Overpaid
+        } else if delta < -PAYMENT_TOLERANCE {
+            PaymentStatus::PartiallyPaid
+        } else {
+            PaymentStatus::Confirmed
+        };
+
+        assert_eq!(status, expected);
     }
 }

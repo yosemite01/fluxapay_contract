@@ -29,3 +29,10 @@ unmaintained = "warn"
 unsound = "warn"
 notice = "warn"
 ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+skip = []
+skip-tree = []

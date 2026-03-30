@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::{
     merchant_registry::{KycTier, MerchantRegistry, MerchantRegistryClient},
     DisputeStatus, PaymentProcessor, PaymentProcessorClient, PaymentStatus, RefundManager,

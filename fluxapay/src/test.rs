@@ -68,6 +68,48 @@ fn test_create_payment() {
 }
 
 #[test]
+fn test_create_payment_rate_limit_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let currency = Symbol::new(&env, "USDC");
+    let deposit_address = Address::generate(&env);
+    let expires_at = env.ledger().timestamp() + 3600;
+
+    for i in 0..CREATE_PAYMENT_MAX_PER_WINDOW {
+        let payment_id = format_id(&env, "rate_limit_", i as u64);
+        client.create_payment(
+            &payment_id,
+            &merchant_id,
+            &100i128,
+            &currency,
+            &deposit_address,
+            &expires_at,
+            &None::<String>,
+            &None::<String>,
+        );
+    }
+
+    let overflow_id = String::from_str(&env, "rate_limit_overflow");
+    let overflow = client.try_create_payment(
+        &overflow_id,
+        &merchant_id,
+        &100i128,
+        &currency,
+        &deposit_address,
+        &expires_at,
+        &None::<String>,
+        &None::<String>,
+    );
+
+    assert_eq!(overflow, Err(Ok(Error::RateLimitExceeded)));
+}
+
+#[test]
 fn test_verify_payment_success() {
     let env = Env::default();
     env.mock_all_auths();
@@ -545,7 +587,7 @@ fn test_create_refund_requires_auth() {
 #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
 fn test_create_payment_requires_auth() {
     let env = Env::default();
-    let (admin, client) = setup_payment_processor(&env);
+    let (_admin, client) = setup_payment_processor(&env);
 
     let payment_id = String::from_str(&env, "payment_123");
     let merchant_id = Address::generate(&env);

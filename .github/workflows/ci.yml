@@ -112,7 +112,7 @@ jobs:
 
       - name: Run cargo-deny
         working-directory: .
-        run: cargo deny check licenses advisories
+        run: cargo deny check bans licenses advisories
 
   # Job 3: Build the contract
   build:
@@ -242,6 +242,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose --all-features
+
+      - name: Run bounded property tests
+        run: PROPTEST_CASES=64 cargo test -p fluxapay proptests:: --all-features -- --test-threads=1
 
   # Job 5: Coverage report
   coverage:

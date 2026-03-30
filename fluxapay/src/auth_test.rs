@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::{
     merchant_registry::{MerchantRegistry, MerchantRegistryClient},
     PaymentProcessor, PaymentProcessorClient, RefundManager, RefundManagerClient,

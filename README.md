@@ -12,6 +12,15 @@ Automated testing and deployment pipeline using GitHub Actions:
 - **CD:** Auto-deploys to development and staging on merge to main; production requires manual approval
 - All tests must pass before deployment
 
+### Security and Dependency Checks (Local)
+
+- `cargo audit --deny warnings`
+- `cargo deny check bans licenses advisories`
+
+### Bounded Property Tests (Local)
+
+- `PROPTEST_CASES=64 cargo test -p fluxapay proptests:: --all-features -- --test-threads=1`
+
 ---
 
 ## What Problem does Fluxapay solve?

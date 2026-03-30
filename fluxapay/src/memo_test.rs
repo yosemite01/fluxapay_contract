@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::{
     access_control::role_merchant, PaymentProcessor, PaymentProcessorClient, PaymentStatus,
 };

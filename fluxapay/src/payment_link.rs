@@ -23,7 +23,13 @@ pub enum LinkDataKey {
 pub struct PaymentLinkManager;
 
 #[contractimpl]
+#[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl PaymentLinkManager {
+    pub fn version() -> u32 {
+        1
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn create_link(
         env: Env,
         merchant: Address,

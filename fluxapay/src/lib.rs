@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)] // Soroban contractargs macro generates fns exceeding the 7-arg limit
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env,
     MuxedAddress, String, Symbol, Vec,
@@ -106,6 +107,10 @@ pub struct Dispute {
     pub created_at: u64,
     pub resolved_at: Option<u64>,
     pub resolution_notes: Option<String>,
+    /// Operator-set deadline (Unix timestamp) by which the dispute must be resolved.
+    pub review_deadline: Option<u64>,
+    /// True when the dispute has been flagged for escalation (e.g. deadline exceeded).
+    pub escalated: bool,
 }
 
 #[contracterror]
@@ -125,12 +130,21 @@ pub enum Error {
     AccessControlError = 15,
     RefundExceedsPayment = 16,
     ContractPaused = 17,
+    RateLimitExceeded = 18,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantCreateRateLimit {
+    pub last_payment_at: u64,
+    pub count: u32,
 }
 
 #[contracttype]
 pub enum DataKey {
     Payment(String),
     MerchantPayments(Address),
+    MerchantRateLimit(Address),
     Refund(String),
     PaymentRefunds(String),
     RefundCounter,
@@ -145,9 +159,16 @@ pub enum DataKey {
 const SHORT_LIVE_TTL: u32 = 120_960; // ~1 week at 5s/ledger
 const LONG_LIVE_TTL: u32 = 18_921_600; // ~3 years at 5s/ledger
 const TTL_BUMP_THRESHOLD_DIVISOR: u32 = 5;
+const CREATE_PAYMENT_WINDOW_SECS: u64 = 60;
+const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
 
 #[contractimpl]
+#[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl RefundManager {
+    pub fn version() -> u32 {
+        1
+    }
+
     pub fn initialize_refund_manager(env: Env, admin: Address, usdc_token_address: Address) {
         AccessControl::initialize(&env, admin);
         env.storage()
@@ -290,12 +311,12 @@ impl RefundManager {
             return Err(Error::RefundExceedsPayment);
         }
 
-        let counter = Self::get_next_refund_id(&env);
+        let counter = Self::get_next_refund_id(env);
 
         // Build refund ID: "refund_" + counter
         // For simplicity and to avoid complex string manipulation in no_std,
         // we use a match statement for common cases
-        let refund_id = format_id(&env, "refund_", counter);
+        let refund_id = format_id(env, "refund_", counter);
 
         let refund = Refund {
             refund_id: refund_id.clone(),
@@ -319,12 +340,12 @@ impl RefundManager {
             &payment_refunds,
         );
         Self::bump_ttl(
-            &env,
+            env,
             &DataKey::PaymentRefunds(payment_id.clone()),
             LONG_LIVE_TTL,
         );
 
-        Self::bump_refund_ttl(&env, &refund_id, &refund.status);
+        Self::bump_refund_ttl(env, &refund_id, &refund.status);
 
         // Issue #27: emit REFUND/CREATED event
         env.events().publish(
@@ -381,9 +402,7 @@ impl RefundManager {
         env.storage()
             .persistent()
             .set(&DataKey::Refund(refund_id.clone()), &refund);
-        Self::bump_refund_ttl(&env, &refund_id, &refund.status);
-
-        // Issue #27: emit REFUND/COMPLETED event
+        Self::bump_refund_ttl(env, &refund_id, &refund.status);
         env.events().publish(
             (Symbol::new(env, "REFUND"), Symbol::new(env, "COMPLETED")),
             (refund.payment_id, refund_id, refund.amount),
@@ -541,6 +560,8 @@ impl RefundManager {
             created_at: env.ledger().timestamp(),
             resolved_at: None,
             resolution_notes: None,
+            review_deadline: None,
+            escalated: false,
         };
 
         env.storage()
@@ -601,6 +622,62 @@ impl RefundManager {
                 Symbol::new(&env, "UNDER_REVIEW"),
             ),
             (dispute.payment_id, dispute_id, dispute.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Operator-only: set or update the review deadline for an open or under-review dispute.
+    /// Emits DISPUTE/DEADLINE_SET. If the current ledger time already exceeds the deadline,
+    /// the dispute is also flagged as escalated and DISPUTE/ESCALATED is emitted.
+    pub fn set_dispute_deadline(
+        env: Env,
+        operator: Address,
+        dispute_id: String,
+        deadline: u64,
+    ) -> Result<(), Error> {
+        operator.require_auth();
+
+        let has_settlement =
+            AccessControl::has_role(&env, &role_settlement_operator(&env), &operator);
+        let has_oracle = AccessControl::has_role(&env, &role_oracle(&env), &operator);
+
+        if !has_settlement && !has_oracle {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        dispute.review_deadline = Some(deadline);
+
+        let now = env.ledger().timestamp();
+        if now > deadline && !dispute.escalated {
+            dispute.escalated = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+            Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+            env.events().publish(
+                (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "ESCALATED")),
+                (dispute.payment_id.clone(), dispute_id.clone(), dispute.amount),
+            );
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+            Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DISPUTE"),
+                Symbol::new(&env, "DEADLINE_SET"),
+            ),
+            (dispute.payment_id, dispute_id, deadline),
         );
 
         Ok(())
@@ -796,7 +873,12 @@ impl RefundManager {
 }
 
 #[contractimpl]
+#[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl PaymentProcessor {
+    pub fn version() -> u32 {
+        1
+    }
+
     pub fn initialize_payment_processor(env: Env, admin: Address) {
         AccessControl::initialize(&env, admin);
         // Initialize paused state to false
@@ -874,7 +956,38 @@ impl PaymentProcessor {
         Ok(())
     }
 
+    fn enforce_create_payment_rate_limit(env: &Env, merchant_id: &Address) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        let key = DataKey::MerchantRateLimit(merchant_id.clone());
+
+        let mut state: MerchantCreateRateLimit =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantCreateRateLimit {
+                    last_payment_at: now,
+                    count: 0,
+                });
+
+        if now.saturating_sub(state.last_payment_at) >= CREATE_PAYMENT_WINDOW_SECS {
+            state.count = 0;
+        }
+
+        if state.count >= CREATE_PAYMENT_MAX_PER_WINDOW {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        state.count = state.count.saturating_add(1);
+        state.last_payment_at = now;
+
+        env.storage().persistent().set(&key, &state);
+        Self::bump_ttl(env, &key, SHORT_LIVE_TTL);
+
+        Ok(())
+    }
+
     #[allow(deprecated)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_payment(
         env: Env,
         payment_id: String,
@@ -904,10 +1017,8 @@ impl PaymentProcessor {
                 crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
             match registry_client.try_get_merchant(&merchant_id) {
                 Ok(Ok(merchant)) => {
-                    // Require merchant to be verified (not Unverified) and active
-                    if merchant.kyc_tier == crate::merchant_registry::KycTier::Unverified
-                        || !merchant.active
-                    {
+                    // Require merchant to be verified (not Unverified), active, and not suspended
+                    if merchant.kyc_tier == crate::merchant_registry::KycTier::Unverified || !merchant.active || merchant.suspended_at.is_some() {
                         return Err(Error::Unauthorized);
                     }
                 }
@@ -933,6 +1044,8 @@ impl PaymentProcessor {
         if payment_id.is_empty() {
             return Err(Error::InvalidPaymentId);
         }
+
+        Self::enforce_create_payment_rate_limit(&env, &merchant_id)?;
 
         let payment = PaymentCharge {
             payment_id: payment_id.clone(),
@@ -1017,7 +1130,7 @@ impl PaymentProcessor {
 
         let diff = amount_received - payment.amount;
 
-        let new_status = if diff >= 0 && diff <= PAYMENT_TOLERANCE {
+        let new_status = if (0..=PAYMENT_TOLERANCE).contains(&diff) {
             // Exact match or tiny overpay within tolerance → Confirmed
             PaymentStatus::Confirmed
         } else if diff > PAYMENT_TOLERANCE {

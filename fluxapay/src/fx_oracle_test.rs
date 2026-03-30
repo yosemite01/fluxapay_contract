@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::{FXOracle, FXOracleClient, FXOracleError};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},

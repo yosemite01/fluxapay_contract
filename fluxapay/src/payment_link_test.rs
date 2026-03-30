@@ -1,6 +1,4 @@
-#![cfg(test)]
-
-use crate::{Error, PaymentLink, PaymentLinkManager, PaymentLinkManagerClient};
+use crate::{PaymentLinkManager, PaymentLinkManagerClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     Address, Env, String, Symbol,
@@ -38,7 +36,7 @@ fn test_create_link() {
     let link = client.get_link(&link_id);
     assert_eq!(link.merchant_id, merchant);
     assert_eq!(link.amount, amount);
-    assert_eq!(link.active, true);
+    assert!(link.active);
 }
 
 #[test]
@@ -61,7 +59,7 @@ fn test_use_link_fixed_amount() {
     );
 
     let payment_id = client.use_link(&payer, &link_id, &amount);
-    assert!(payment_id.len() > 0);
+    assert!(!payment_id.is_empty());
 
     let link = client.get_link(&link_id);
     assert_eq!(link.use_count, 1);
@@ -131,7 +129,7 @@ fn test_deactivate_link() {
 
     client.deactivate_link(&merchant, &link_id);
     let link = client.get_link(&link_id);
-    assert_eq!(link.active, false);
+    assert!(!link.active);
 }
 
 #[test]
