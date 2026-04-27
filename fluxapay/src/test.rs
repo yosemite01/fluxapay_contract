@@ -769,3 +769,66 @@ fn test_admin_in_role_members_after_init() {
     assert_eq!(members.len(), 1);
     assert_eq!(members.get(0), Some(admin));
 }
+
+fn setup_refund_manager_with_token(env: &Env) -> (Address, RefundManagerClient<'_>, Address) {
+    let contract_id = env.register(RefundManager, ());
+    let client = RefundManagerClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let usdc_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.initialize_refund_manager(&admin, &usdc_token);
+    let token_admin_client = token::StellarAssetClient::new(env, &usdc_token);
+    token_admin_client.mint(&contract_id, &1_000_000_000_000i128);
+    (admin, client, usdc_token)
+}
+
+#[test]
+fn test_process_refund_deducts_fee_from_requester() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token) = setup_refund_manager_with_token(&env);
+
+    let payment_id = String::from_str(&env, "payment_fee_1");
+    let merchant_id = Address::generate(&env);
+    let refund_amount = 10_000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(&payment_id, &merchant_id, &refund_amount, &Symbol::new(&env, "USDC"));
+    let refund_id = client.create_refund(&payment_id, &refund_amount, &String::from_str(&env, "fee test"), &requester);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    client.process_refund(&operator, &refund_id);
+
+    let token_client = token::TokenClient::new(&env, &usdc_token);
+    let fee = refund_amount * 100 / 10_000; // 1%
+    let net = refund_amount - fee;
+
+    assert_eq!(token_client.balance(&requester), net);
+}
+
+#[test]
+fn test_process_refund_sends_fee_to_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token) = setup_refund_manager_with_token(&env);
+
+    let payment_id = String::from_str(&env, "payment_fee_2");
+    let merchant_id = Address::generate(&env);
+    let refund_amount = 10_000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(&payment_id, &merchant_id, &refund_amount, &Symbol::new(&env, "USDC"));
+    let refund_id = client.create_refund(&payment_id, &refund_amount, &String::from_str(&env, "fee test"), &requester);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    client.process_refund(&operator, &refund_id);
+
+    let token_client = token::TokenClient::new(&env, &usdc_token);
+    let fee = refund_amount * 100 / 10_000; // 1%
+
+    assert_eq!(token_client.balance(&admin), fee);
+}

@@ -161,6 +161,8 @@ const LONG_LIVE_TTL: u32 = 18_921_600; // ~3 years at 5s/ledger
 const TTL_BUMP_THRESHOLD_DIVISOR: u32 = 5;
 const CREATE_PAYMENT_WINDOW_SECS: u64 = 60;
 const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
+/// 1% refund fee in basis points (100 bps = 1%).
+const REFUND_FEE_BPS: i128 = 100;
 
 #[contractimpl]
 #[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
@@ -387,13 +389,21 @@ impl RefundManager {
             .ok_or(Error::Unauthorized)?;
         let token_client = token::TokenClient::new(env, &usdc_token_address);
 
+        let fee = refund.amount * REFUND_FEE_BPS / 10_000;
+        let net_amount = refund.amount - fee;
+
         let from = env.current_contract_address();
         let to: MuxedAddress = (&refund.requester).into();
-        if token_client
-            .try_transfer(&from, &to, &refund.amount)
-            .is_err()
-        {
+        if token_client.try_transfer(&from, &to, &net_amount).is_err() {
             return Ok(());
+        }
+
+        // Transfer fee to admin
+        if fee > 0 {
+            if let Some(admin) = AccessControl::get_admin(env) {
+                let admin_muxed: MuxedAddress = (&admin).into();
+                let _ = token_client.try_transfer(&from, &admin_muxed, &fee);
+            }
         }
 
         refund.status = RefundStatus::Completed;
