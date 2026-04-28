@@ -1,5 +1,6 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Env, MuxedAddress, String, Symbol,
+    contract, contractimpl, contracttype, token, vec, Address, Env, MuxedAddress, String, Symbol,
+    Vec,
 };
 
 #[contracttype]
@@ -17,6 +18,8 @@ pub struct PaymentLink {
     /// If true, funds are transferred directly to the merchant wallet on use_link,
     /// bypassing the escrow/platform wallet (issue #111).
     pub direct_transfer: bool,
+    /// Optional metadata attached to this payment link.
+    pub metadata: Option<Map<String, String>>,
 }
 
 #[contracttype]
@@ -45,6 +48,7 @@ impl PaymentLinkManager {
         expires_at: Option<u64>,
         max_uses: Option<u32>,
         direct_transfer: bool,
+        metadata: Option<Map<String, String>>,
     ) -> String {
         merchant.require_auth();
 
@@ -59,6 +63,7 @@ impl PaymentLinkManager {
             use_count: 0,
             active: true,
             direct_transfer,
+            metadata,
         };
 
         env.storage()
@@ -171,5 +176,23 @@ impl PaymentLinkManager {
             .persistent()
             .get(&LinkDataKey::Link(link_id.clone()))
             .ok_or(crate::Error::PaymentNotFound)
+    }
+
+    /// Verify the status of multiple payment links in a single call.
+    /// Returns a vector of (link_id, is_active, use_count, max_uses) tuples.
+    pub fn verify_batch(env: Env, link_ids: Vec<String>) -> Vec<(String, bool, u32, Option<u32>)> {
+        let mut results = vec![&env];
+        for link_id in link_ids.iter() {
+            match Self::get_link_internal(&env, &link_id) {
+                Ok(link) => {
+                    results.push_back((link_id.clone(), link.active, link.use_count, link.max_uses));
+                }
+                Err(_) => {
+                    // Link not found - return inactive status
+                    results.push_back((link_id.clone(), false, 0, None));
+                }
+            }
+        }
+        results
     }
 }

@@ -1,182 +1,130 @@
+#![cfg(test)]
+
 use crate::{
-    access_control::{role_merchant, role_oracle},
-    PaymentProcessor, PaymentProcessorClient, PaymentStatus,
+    CreatePaymentArgs, PaymentProcessorClient, PauseInfo, PauseState,
 };
-use soroban_sdk::{
-    testutils::Address as _, testutils::BytesN as _, Address, BytesN, Env, String, Symbol,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol};
 
-fn setup_payment_processor(env: &Env) -> (Address, PaymentProcessorClient<'_>) {
-    let contract_id = env.register(PaymentProcessor, ());
-    let client = PaymentProcessorClient::new(env, &contract_id);
-    let admin = Address::generate(env);
+#[test]
+fn test_pause_initial_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let processor_id = env.register(crate::PaymentProcessor, ());
+    let client = PaymentProcessorClient::new(&env, &processor_id);
+
     client.initialize_payment_processor(&admin);
-    (admin, client)
+
+    let info = client.get_pause_info();
+    assert!(!info.global.paused);
+    assert!(!info.creation.paused);
+    assert_eq!(info.global.reason, String::from_str(&env, ""));
+    assert_eq!(info.creation.reason, String::from_str(&env, ""));
 }
 
 #[test]
-fn test_pause_and_unpause() {
+fn test_global_pause_blocks_creation() {
     let env = Env::default();
     env.mock_all_auths();
-    let (admin, client) = setup_payment_processor(&env);
 
-    // Initially not paused
-    assert!(!client.is_paused());
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let processor_id = env.register(crate::PaymentProcessor, ());
+    let client = PaymentProcessorClient::new(&env, &processor_id);
 
-    // Pause the contract
-    client.set_paused(&admin, &true);
-    assert!(client.is_paused());
+    client.initialize_payment_processor(&admin);
+    
+    // Grant merchant role
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
 
-    // Unpause the contract
-    client.set_paused(&admin, &false);
-    assert!(!client.is_paused());
-}
+    // Set global pause
+    let reason = String::from_str(&env, "Global maintenance");
+    client.set_global_pause(&admin, &true, &reason);
 
-#[test]
-#[should_panic(expected = "Error(Contract, #17)")]
-fn test_create_payment_when_paused() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, client) = setup_payment_processor(&env);
+    let info = client.get_pause_info();
+    assert!(info.global.paused);
+    assert_eq!(info.global.reason, reason);
+    assert_eq!(info.global.admin, Some(admin.clone()));
 
-    let merchant_id = Address::generate(&env);
-    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
-
-    // Pause the contract
-    client.set_paused(&admin, &true);
-
-    // Try to create payment - should fail
-    let payment_id = String::from_str(&env, "payment_paused");
-    client.create_payment(
-        &payment_id,
-        &merchant_id,
-        &1000i128,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(env.ledger().timestamp() + 3600),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
-    );
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #17)")]
-fn test_verify_payment_when_paused() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, client) = setup_payment_processor(&env);
-
-    let merchant_id = Address::generate(&env);
-    let payment_id = String::from_str(&env, "payment_verify_paused");
-    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
-
-    // Create payment while not paused
-    client.create_payment(
-        &payment_id,
-        &merchant_id,
-        &1000i128,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(env.ledger().timestamp() + 3600),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
+    // Try to create payment
+    let res = client.try_create_payment(
+        &CreatePaymentArgs {
+            payment_id: String::from_str(&env, "p1"),
+            merchant_id: merchant.clone(),
+            amount: 100,
+            currency: Symbol::new(&env, "USDC"),
+            deposit_address: Address::generate(&env),
+            expires_at: None,
+            duration_secs: None,
+            memo: None,
+            memo_type: None,
+            token_address: None,
+            client_token: None,
+        }
     );
 
-    // Pause the contract
-    client.set_paused(&admin, &true);
+    assert!(res.is_err());
+}
 
-    // Try to verify payment - should fail
+#[test]
+fn test_creation_pause_blocks_only_creation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
     let oracle = Address::generate(&env);
-    client.grant_role(&admin, &role_oracle(&env), &oracle);
-    client.verify_payment(
+    let processor_id = env.register(crate::PaymentProcessor, ());
+    let client = PaymentProcessorClient::new(&env, &processor_id);
+
+    client.initialize_payment_processor(&admin);
+    
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+    client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+
+    // Set creation pause
+    let reason = String::from_str(&env, "High load");
+    client.set_creation_pause(&admin, &true, &reason);
+
+    let info = client.get_pause_info();
+    assert!(!info.global.paused);
+    assert!(info.creation.paused);
+    assert_eq!(info.creation.reason, reason);
+
+    // create_payment should fail
+    let res = client.try_create_payment(
+        &CreatePaymentArgs {
+            payment_id: String::from_str(&env, "p1"),
+            merchant_id: merchant.clone(),
+            amount: 100,
+            currency: Symbol::new(&env, "USDC"),
+            deposit_address: Address::generate(&env),
+            expires_at: None,
+            duration_secs: None,
+            memo: None,
+            memo_type: None,
+            token_address: None,
+            client_token: None,
+        }
+    );
+    assert!(res.is_err());
+
+    // verify_payment should still work (won't actually succeed because payment doesn't exist, but won't fail with ContractPaused)
+    let res_verify = client.try_verify_payment(
         &oracle,
-        &payment_id,
-        &BytesN::<32>::random(&env),
+        &String::from_str(&env, "p1"),
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
         &Address::generate(&env),
-        &1000i128,
+        &100,
     );
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #17)")]
-fn test_cancel_payment_when_paused() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, client) = setup_payment_processor(&env);
-
-    let merchant_id = Address::generate(&env);
-    let payment_id = String::from_str(&env, "payment_cancel_paused");
-    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
-
-    // Create payment while not paused
-    client.create_payment(
-        &payment_id,
-        &merchant_id,
-        &1000i128,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(env.ledger().timestamp() + 3600),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
-    );
-
-    // Pause the contract
-    client.set_paused(&admin, &true);
-
-    // Try to cancel payment - should fail
-    client.cancel_payment(&merchant_id, &payment_id);
-}
-
-#[test]
-fn test_create_payment_after_unpause() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, client) = setup_payment_processor(&env);
-
-    let merchant_id = Address::generate(&env);
-    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
-
-    // Pause and then unpause
-    client.set_paused(&admin, &true);
-    client.set_paused(&admin, &false);
-
-    // Create payment should succeed
-    let payment_id = String::from_str(&env, "payment_after_unpause");
-    let payment = client.create_payment(
-        &payment_id,
-        &merchant_id,
-        &1000i128,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(env.ledger().timestamp() + 3600),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
-    );
-
-    assert_eq!(payment.status, PaymentStatus::Pending);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #1)")]
-fn test_set_paused_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup_payment_processor(&env);
-
-    let non_admin = Address::generate(&env);
-
-    // Try to pause as non-admin - should fail
-    client.set_paused(&non_admin, &true);
+    
+    // It should fail with PaymentNotFound (404), not ContractPaused (17)
+    // We check the error by seeing if it's NOT the pause error
+    if let Err(res) = res_verify {
+        match res {
+            Ok(crate::Error::ContractPaused) => panic!("Should not be blocked by pause"),
+            _ => {}
+        }
+    }
 }

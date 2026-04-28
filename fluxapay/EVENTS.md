@@ -91,25 +91,25 @@ Emitted when a refund request is rejected by an operator.
 
 Emitted by the `RefundManager` contract.
 
-### DISPUTE/OPENED
+### DISPUTE/CREATED
 Emitted when a new dispute is opened for a payment.
-- **Topics**: `(DISPUTE, OPENED)`
-- **Data**: `(payment_id: String, dispute_id: String, amount: i128)`
+- **Topics**: `(DISPUTE, CREATED)`
+- **Data**: `(dispute_id: String, payment_id: String)`
 
-### DISPUTE/UNDER_REVIEW
+### DISPUTE/REVIEWED
 Emitted when a dispute's status is changed to under review by an operator.
-- **Topics**: `(DISPUTE, UNDER_REVIEW)`
-- **Data**: `(payment_id: String, dispute_id: String, amount: i128)`
+- **Topics**: `(DISPUTE, REVIEWED)`
+- **Data**: `(dispute_id: String, payment_id: String)`
 
 ### DISPUTE/RESOLVED
 Emitted when a dispute is resolved in favour of the customer (refund issued).
 - **Topics**: `(DISPUTE, RESOLVED)`
-- **Data**: `(payment_id: String, dispute_id: String, amount: i128)`
+- **Data**: `(dispute_id: String, payment_id: String)`
 
 ### DISPUTE/REJECTED
 Emitted when a dispute is rejected by an operator.
 - **Topics**: `(DISPUTE, REJECTED)`
-- **Data**: `(payment_id: String, dispute_id: String, amount: i128)`
+- **Data**: `(dispute_id: String, payment_id: String)`
 
 ---
 
@@ -152,3 +152,25 @@ Emitted when a payer uses a payment link to initiate a payment.
 Emitted when a merchant deactivates a payment link.
 - **Topics**: `(LINK, DEACTIVATED)`
 - **Data**: `link_id: String`
+
+---
+
+## Subscription Events
+
+Emitted by the `RefundManager` contract.
+
+### SUBSCRIPTION/CREATED
+Emitted when a new subscription is created.
+- **Topics**: `(SUBSCRIPTION, CREATED)`
+- **Data**: `(subscription_id: String, payer: Address, plan_id: String)`
+
+---
+
+## Stream Events
+
+Emitted by the `PaymentProcessor` contract.
+
+### STREAM/CREATED
+Emitted when a new payment stream is created.
+- **Topics**: `(STREAM, CREATED)`
+- **Data**: `(stream_id: String, sender: Address, amount: i128)`

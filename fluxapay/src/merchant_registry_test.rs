@@ -333,22 +333,23 @@ fn test_unverified_merchant_cannot_create_payment() {
     // Try to create payment - should fail because merchant is not verified
     let payment_id = String::from_str(&env, "PAY_01");
     let amount = 1000i128;
-    let expires_at = env.ledger().timestamp() + 3600;
+
+    let args = crate::CreatePaymentArgs {
+        payment_id,
+        merchant_id: merchant.clone(),
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+    };
 
     // This should panic with Unauthorized error
-    payment_client.create_payment(
-        &payment_id,
-        &merchant,
-        &amount,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(expires_at),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
-    );
+    payment_client.create_payment(&args);
 }
 
 #[test]
@@ -386,26 +387,27 @@ fn test_verified_merchant_can_create_payment() {
     );
 
     // Manually grant MERCHANT role (simulating what would happen with set_refund_manager_address)
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+    payment_client.grant_role(&admin, &crate::role_merchant(&env), &merchant);
 
     // Now create payment should succeed
     let payment_id = String::from_str(&env, "PAY_01");
     let amount = 1000i128;
-    let expires_at = env.ledger().timestamp() + 3600;
 
-    let payment = payment_client.create_payment(
-        &payment_id,
-        &merchant,
-        &amount,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(expires_at),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
-    );
+    let args = crate::CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+    };
+
+    let payment = payment_client.create_payment(&args);
 
     assert_eq!(payment.payment_id, payment_id);
     assert_eq!(payment.merchant_id, merchant);

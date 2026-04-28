@@ -7,6 +7,8 @@ import {
   PaymentStatus,
   RefundStatus,
   DisputeStatus,
+  PauseInfo,
+  PauseState,
 } from "./contracts/fluxapay/src/index.js";
 import { Address, Networks } from "@stellar/stellar-sdk";
 
@@ -100,6 +102,43 @@ export class FluxapayClient {
   async getPayment(paymentId: string) {
     return this.contract.get_payment({ payment_id: paymentId });
   }
+
+  /**
+   * Get consolidated pause information
+   */
+  async getPauseInfo() {
+    return this.contract.get_pause_info();
+  }
+
+  /**
+   * Set global pause status (Admin only)
+   */
+  async setGlobalPause(params: {
+    admin: string;
+    paused: boolean;
+    reason: string;
+  }) {
+    return this.contract.set_global_pause({
+      admin: params.admin,
+      paused: params.paused,
+      reason: params.reason,
+    });
+  }
+
+  /**
+   * Set creation pause status (Admin only)
+   */
+  async setCreationPause(params: {
+    admin: string;
+    paused: boolean;
+    reason: string;
+  }) {
+    return this.contract.set_creation_pause({
+      admin: params.admin,
+      paused: params.paused,
+      reason: params.reason,
+    });
+  }
 }
 
 export {
@@ -110,4 +149,6 @@ export {
   PaymentStatus,
   RefundStatus,
   DisputeStatus,
+  PauseInfo,
+  PauseState,
 };

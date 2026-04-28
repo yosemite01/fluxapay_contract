@@ -63,22 +63,22 @@ fn test_happy_path_flow() {
     // 2. Create and Verify Payment
     let payment_id = String::from_str(&env, "PAY_01");
     let amount = 1000i128;
-    let expires_at = env.ledger().timestamp() + 3600;
 
     payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-    payment_client.create_payment(
-        &payment_id,
-        &merchant,
-        &amount,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(expires_at),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
-    );
+    let args = crate::CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+    };
+    payment_client.create_payment(&args);
 
     let tx_hash = BytesN::<32>::random(&env);
     let oracle = Address::generate(&env);
@@ -133,19 +133,20 @@ fn test_settlement_path() {
     let payment_id = String::from_str(&env, "PAY_SETTLE");
     let amount = 2000i128;
     payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-    payment_client.create_payment(
-        &payment_id,
-        &merchant,
-        &amount,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(env.ledger().timestamp() + 3600),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
-    );
+    let args = crate::CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+    };
+    payment_client.create_payment(&args);
 
     let oracle = Address::generate(&env);
     payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
@@ -178,19 +179,20 @@ fn test_failure_and_expiration_path() {
     let expires_at = env.ledger().timestamp() + 100;
 
     payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-    payment_client.create_payment(
-        &payment_id,
-        &merchant,
-        &amount,
-        &Symbol::new(&env, "USDC"),
-        &Address::generate(&env),
-        &Some(expires_at),
-                &None::<u64>,
-                &None::<String>,
-        &None::<String>,
-        &None::<Address>,
-    &None::<String>,
-    );
+    let args = crate::CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(expires_at),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+    };
+    payment_client.create_payment(&args);
 
     // Jump forward in time
     env.ledger().set_timestamp(expires_at + 1);
