@@ -197,6 +197,74 @@ pub struct SettlementSplit {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubscriptionStatus {
+    Active,
+    Paused,
+    Cancelled,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Subscription {
+    pub subscription_id: String,
+    pub merchant_id: Address,
+    pub payer_address: Address,
+    pub plan_id: String,
+    pub amount: i128,
+    pub currency: Symbol,
+    pub interval_secs: u64,
+    pub next_payment_at: u64,
+    pub status: SubscriptionStatus,
+    pub created_at: u64,
+    pub last_payment_at: Option<u64>,
+    pub total_payments: u32,
+    pub max_payments: Option<u32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPlan {
+    pub plan_id: String,
+    pub merchant_id: Address,
+    pub name: String,
+    pub description: String,
+    pub amount: i128,
+    pub currency: Symbol,
+    pub interval_secs: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamStatus {
+    Pending,
+    Active,
+    Paused,
+    Completed,
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Stream {
+    pub stream_id: String,
+    pub sender: Address,
+    pub recipient: Address,
+    pub token_address: Address,
+    pub amount: i128,
+    pub currency: Symbol,
+    pub start_time: u64,
+    pub cliff_time: u64,
+    pub end_time: u64,
+    pub status: StreamStatus,
+    pub deposited_amount: i128,
+    pub withdrawn_amount: i128,
+    pub created_at: u64,
+}
+
+#[contracttype]
 pub enum DataKey {
     Payment(String),
     MerchantPayments(Address),
@@ -215,6 +283,12 @@ pub enum DataKey {
     MerchantAmountLimits(Address),
     GlobalAmountLimits,
     IdempotencyKey(String),
+    SubscriptionPlan(String),
+    Subscription(String),
+    PayerSubscriptions(Address),
+    SubscriptionCounter,
+    Stream(String),
+    StreamCounter,
 }
 
 const SHORT_LIVE_TTL: u32 = 120_960; // ~1 week at 5s/ledger
@@ -699,10 +773,10 @@ impl RefundManager {
 
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
 
-        // Issue #27: emit DISPUTE/OPENED event
+        // Issue #27: emit DISPUTE_CREATED event
         env.events().publish(
-            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "OPENED")),
-            (payment_id, dispute_id.clone(), amount),
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "CREATED")),
+            (dispute_id.clone(), payment_id),
         );
 
         Ok(dispute_id)
@@ -732,13 +806,13 @@ impl RefundManager {
             .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
 
-        // Issue #27: emit DISPUTE/UNDER_REVIEW event
+        // Issue #27: emit DISPUTE_REVIEWED event
         env.events().publish(
             (
                 Symbol::new(&env, "DISPUTE"),
-                Symbol::new(&env, "UNDER_REVIEW"),
+                Symbol::new(&env, "REVIEWED"),
             ),
-            (dispute.payment_id, dispute_id, dispute.amount),
+            (dispute_id, dispute.payment_id),
         );
 
         Ok(())
@@ -851,10 +925,10 @@ impl RefundManager {
             .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
 
-        // Issue #27: emit DISPUTE/RESOLVED event
+        // Issue #27: emit DISPUTE_RESOLVED event
         env.events().publish(
             (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "RESOLVED")),
-            (dispute.payment_id, dispute_id, dispute.amount),
+            (dispute_id, dispute.payment_id),
         );
 
         Ok(refund_id)
@@ -891,10 +965,10 @@ impl RefundManager {
             .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
 
-        // Issue #27: emit DISPUTE/REJECTED event
+        // Issue #27: emit DISPUTE_REJECTED event
         env.events().publish(
             (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "REJECTED")),
-            (dispute.payment_id, dispute_id, dispute.amount),
+            (dispute_id, dispute.payment_id),
         );
 
         Ok(())
@@ -943,6 +1017,282 @@ impl RefundManager {
         env.storage()
             .persistent()
             .get(&DataKey::PaymentDisputes(payment_id.clone()))
+            .unwrap_or_else(|| vec![env])
+    }
+
+    // Subscription management functions
+    pub fn create_subscription_plan(
+        env: Env,
+        merchant: Address,
+        plan_id: String,
+        name: String,
+        description: String,
+        amount: i128,
+        currency: Symbol,
+        interval_secs: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        if !AccessControl::has_role(&env, &role_merchant(&env), &merchant) {
+            return Err(Error::Unauthorized);
+        }
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if interval_secs == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let plan = SubscriptionPlan {
+            plan_id: plan_id.clone(),
+            merchant_id: merchant,
+            name,
+            description,
+            amount,
+            currency,
+            interval_secs,
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubscriptionPlan(plan_id), &plan);
+
+        Ok(())
+    }
+
+    pub fn get_subscription_plan(env: Env, plan_id: String) -> Result<SubscriptionPlan, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SubscriptionPlan(plan_id))
+            .ok_or(Error::PaymentNotFound)
+    }
+
+    pub fn deactivate_subscription_plan(
+        env: Env,
+        merchant: Address,
+        plan_id: String,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let mut plan: SubscriptionPlan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubscriptionPlan(plan_id.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if plan.merchant_id != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        plan.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubscriptionPlan(plan_id), &plan);
+
+        Ok(())
+    }
+
+    pub fn subscribe(
+        env: Env,
+        payer: Address,
+        plan_id: String,
+        max_payments: Option<u32>,
+    ) -> Result<String, Error> {
+        payer.require_auth();
+
+        let plan: SubscriptionPlan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubscriptionPlan(plan_id.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if !plan.active {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        let counter = Self::get_next_subscription_id(&env);
+        let subscription_id = format_id(&env, "sub_", counter);
+
+        let now = env.ledger().timestamp();
+        let subscription = Subscription {
+            subscription_id: subscription_id.clone(),
+            merchant_id: plan.merchant_id.clone(),
+            payer_address: payer.clone(),
+            plan_id: plan_id.clone(),
+            amount: plan.amount,
+            currency: plan.currency,
+            interval_secs: plan.interval_secs,
+            next_payment_at: now.saturating_add(plan.interval_secs),
+            status: SubscriptionStatus::Active,
+            created_at: now,
+            last_payment_at: None,
+            total_payments: 0,
+            max_payments,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+        let mut payer_subscriptions =
+            Self::get_payer_subscriptions_internal(&env, &payer);
+        payer_subscriptions.push_back(subscription_id.clone());
+        env.storage().persistent().set(
+            &DataKey::PayerSubscriptions(payer.clone()),
+            &payer_subscriptions,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "SUBSCRIPTION"), Symbol::new(&env, "CREATED")),
+            (subscription_id.clone(), payer, plan_id),
+        );
+
+        Ok(subscription_id)
+    }
+
+    pub fn get_subscription(
+        env: Env,
+        subscription_id: String,
+    ) -> Result<Subscription, Error> {
+        Self::get_subscription_internal(&env, &subscription_id)
+    }
+
+    pub fn get_payer_subscriptions(env: Env, payer: Address) -> Vec<Subscription> {
+        let subscription_ids = Self::get_payer_subscriptions_internal(&env, &payer);
+        let mut subscriptions = vec![&env];
+        for id in subscription_ids.iter() {
+            if let Ok(sub) = Self::get_subscription_internal(&env, &id) {
+                subscriptions.push_back(sub);
+            }
+        }
+        subscriptions
+    }
+
+    pub fn pause_subscription(
+        env: Env,
+        payer: Address,
+        subscription_id: String,
+    ) -> Result<(), Error> {
+        payer.require_auth();
+
+        let mut subscription =
+            Self::get_subscription_internal(&env, &subscription_id)?;
+
+        if subscription.payer_address != payer {
+            return Err(Error::Unauthorized);
+        }
+
+        if subscription.status != SubscriptionStatus::Active {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        subscription.status = SubscriptionStatus::Paused;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscription_id), &subscription);
+
+        Ok(())
+    }
+
+    pub fn resume_subscription(
+        env: Env,
+        payer: Address,
+        subscription_id: String,
+    ) -> Result<(), Error> {
+        payer.require_auth();
+
+        let mut subscription =
+            Self::get_subscription_internal(&env, &subscription_id)?;
+
+        if subscription.payer_address != payer {
+            return Err(Error::Unauthorized);
+        }
+
+        if subscription.status != SubscriptionStatus::Paused {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        subscription.status = SubscriptionStatus::Active;
+        subscription.next_payment_at = env.ledger().timestamp().saturating_add(subscription.interval_secs);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscription_id), &subscription);
+
+        Ok(())
+    }
+
+    pub fn cancel_subscription(
+        env: Env,
+        payer: Address,
+        subscription_id: String,
+    ) -> Result<(), Error> {
+        payer.require_auth();
+
+        let mut subscription =
+            Self::get_subscription_internal(&env, &subscription_id)?;
+
+        if subscription.payer_address != payer {
+            return Err(Error::Unauthorized);
+        }
+
+        subscription.status = SubscriptionStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscription_id), &subscription);
+
+        Ok(())
+    }
+
+    /// Process due subscriptions - called by an operator or oracle
+    pub fn process_due_subscriptions(env: Env, operator: Address) -> Result<u32, Error> {
+        operator.require_auth();
+
+        if !AccessControl::has_role(&env, &role_oracle(&env), &operator)
+            && !AccessControl::has_role(&env, &role_settlement_operator(&env), &operator)
+        {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut processed_count = 0u32;
+
+        // Note: In a real implementation, you'd want to iterate through subscriptions
+        // more efficiently. This is a simplified version.
+        // The actual implementation would need a way to track which subscriptions to check.
+
+        Ok(processed_count)
+    }
+
+    fn get_next_subscription_id(env: &Env) -> u64 {
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubscriptionCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubscriptionCounter, &counter);
+        counter
+    }
+
+    fn get_subscription_internal(
+        env: &Env,
+        subscription_id: &String,
+    ) -> Result<Subscription, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Subscription(subscription_id.clone()))
+            .ok_or(Error::PaymentNotFound)
+    }
+
+    fn get_payer_subscriptions_internal(env: &Env, payer: &Address) -> Vec<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayerSubscriptions(payer.clone()))
             .unwrap_or_else(|| vec![env])
     }
 
@@ -1309,6 +1659,17 @@ impl PaymentProcessor {
     #[allow(deprecated)]
     pub fn create_payment(
         env: Env,
+        payment_id: String,
+        merchant_id: Address,
+        amount: i128,
+        currency: Symbol,
+        deposit_address: Address,
+        expires_at: Option<u64>,
+        duration_secs: Option<u64>,
+        memo: Option<String>,
+        memo_type: Option<String>,
+        token_address: Option<Address>,
+        client_token: Option<String>,
         args: CreatePaymentArgs,
     ) -> Result<PaymentCharge, Error> {
         Self::require_creation_not_paused(&env)?;
@@ -1726,6 +2087,87 @@ impl PaymentProcessor {
         );
 
         Ok(())
+    }
+
+    /// Create a payment stream with relative time offsets.
+    /// Accepts offsets in seconds from the current ledger time.
+    /// Computes absolute times using env.ledger().timestamp().
+    /// Validates that cliff_delay >= start_delay and duration > 0.
+    pub fn create_stream_relative(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        currency: Symbol,
+        /// Seconds from now when the stream starts
+        start_delay: u64,
+        /// Seconds from start when the cliff period ends (must be >= start_delay)
+        cliff_delay: u64,
+        /// Total duration in seconds from start to end (must be > 0)
+        duration: u64,
+    ) -> Result<String, Error> {
+        sender.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if duration == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if cliff_delay < start_delay {
+            return Err(Error::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let start_time = now.saturating_add(start_delay);
+        let cliff_time = start_time.saturating_add(cliff_delay.saturating_sub(start_delay));
+        let end_time = start_time.saturating_add(duration);
+
+        let counter = Self::get_next_stream_id(&env);
+        let stream_id = format_id(&env, "stream_", counter);
+
+        let stream = Stream {
+            stream_id: stream_id.clone(),
+            sender: sender.clone(),
+            recipient,
+            token_address,
+            amount,
+            currency,
+            start_time,
+            cliff_time,
+            end_time,
+            status: StreamStatus::Pending,
+            deposited_amount: 0,
+            withdrawn_amount: 0,
+            created_at: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Stream(stream_id.clone()), &stream);
+
+        env.events().publish(
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CREATED")),
+            (stream_id.clone(), sender, amount),
+        );
+
+        Ok(stream_id)
+    }
+
+    fn get_next_stream_id(env: &Env) -> u64 {
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StreamCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::StreamCounter, &counter);
+        counter
     }
 
     fn get_payment_internal(env: &Env, payment_id: &String) -> Result<PaymentCharge, Error> {
