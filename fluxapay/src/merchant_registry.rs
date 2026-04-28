@@ -16,6 +16,18 @@ pub enum KycTier {
     Business,
 }
 
+/// Fee configuration for a merchant.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfig {
+    /// Platform fee in basis points (100 bps = 1%). 0 means no fee.
+    pub platform_fee_bps: i32,
+    /// Fixed fee per transaction in the smallest currency unit.
+    pub fixed_fee: i128,
+    /// Optional: custom fee recipient address (defaults to admin if None).
+    pub fee_recipient: Option<Address>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Merchant {
@@ -32,6 +44,8 @@ pub struct Merchant {
     pub created_at: u64,
     pub suspension_reason: Option<String>,
     pub suspended_at: Option<u64>,
+    /// Custom fee configuration for this merchant.
+    pub fee_config: Option<FeeConfig>,
 }
 
 #[contracttype]
@@ -81,6 +95,7 @@ impl MerchantRegistry {
         settlement_currency: String,
         payout_address: Option<Address>,
         bank_account: Option<String>,
+        fee_config: Option<FeeConfig>,
     ) -> Result<(), MerchantError> {
         merchant_id.require_auth();
 
@@ -103,6 +118,7 @@ impl MerchantRegistry {
             created_at: env.ledger().timestamp(),
             suspension_reason: None,
             suspended_at: None,
+            fee_config,
         };
 
         env.storage()
@@ -123,6 +139,7 @@ impl MerchantRegistry {
         active: Option<bool>,
         payout_address: Option<Address>,
         bank_account: Option<String>,
+        fee_config: Option<FeeConfig>,
     ) -> Result<(), MerchantError> {
         merchant_id.require_auth();
 
@@ -142,6 +159,9 @@ impl MerchantRegistry {
         }
         if let Some(acct) = bank_account {
             merchant.bank_account = Some(acct);
+        }
+        if let Some(config) = fee_config {
+            merchant.fee_config = Some(config);
         }
 
         env.storage()
@@ -406,6 +426,56 @@ impl MerchantRegistry {
             merchants.push_back(merchant_id.clone());
             env.storage().persistent().set(&key, &merchants);
         }
+    }
+
+    /// Calculate the platform fee for a given amount based on merchant's FeeConfig.
+    /// Returns (platform_fee, net_amount).
+    pub fn calculate_fee(env: Env, merchant_id: Address, amount: i128) -> Result<(i128, i128), MerchantError> {
+        let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        
+        if let Some(ref config) = merchant.fee_config {
+            if config.platform_fee_bps == 0 && config.fixed_fee == 0 {
+                return Ok((0, amount));
+            }
+
+            // Calculate percentage fee
+            let percentage_fee = (amount * (config.platform_fee_bps as i128)) / 10_000;
+            
+            // Total fee is percentage + fixed
+            let total_fee = percentage_fee.saturating_add(config.fixed_fee);
+            
+            // Ensure fee doesn't exceed amount
+            if total_fee >= amount {
+                return Ok((amount, 0));
+            }
+
+            let net_amount = amount.saturating_sub(total_fee);
+            Ok((total_fee, net_amount))
+        } else {
+            // No fee config, no fee
+            Ok((0, amount))
+        }
+    }
+
+    /// Get the fee recipient address for a merchant.
+    /// Returns the custom fee recipient if set, otherwise the admin address.
+    pub fn get_fee_recipient(env: Env, merchant_id: Address) -> Result<Address, MerchantError> {
+        let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        
+        if let Some(ref config) = merchant.fee_config {
+            if let Some(recipient) = &config.fee_recipient {
+                return Ok(recipient.clone());
+            }
+        }
+        
+        // Default to admin if no custom recipient
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
+        
+        Ok(admin)
     }
 
     fn get_merchant_internal(env: &Env, merchant_id: &Address) -> Result<Merchant, MerchantError> {

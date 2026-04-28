@@ -1907,6 +1907,24 @@ fn make_confirmed_payment(
 
 #[test]
 fn test_settle_payment_single_split() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "settle_single");
+    let amount = 1000i128;
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    let recipient = Address::generate(&env);
+    let splits = vec![&env, SettlementSplit { recipient, amount }];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    assert_eq!(client.get_payment(&payment_id).status, PaymentStatus::Settled);
+}
+
 // --- Idempotency key (client_token) tests ---
 
 #[test]

@@ -7,6 +7,7 @@ use soroban_sdk::{
 
 mod access_control;
 pub mod fx_oracle;
+mod dex_router;
 use access_control::{
     role_admin, role_merchant, role_oracle, role_settlement_operator, AccessControl,
 };
@@ -14,6 +15,7 @@ use access_control::{
 #[allow(unused_imports)]
 pub use access_control::AccessControlDataKey;
 pub use fx_oracle::{FXOracle, FXOracleClient, FXOracleError};
+pub use dex_router::{DexRouter, DexRouterClient};
 
 #[contract]
 pub struct PaymentProcessor;
@@ -139,7 +141,7 @@ pub enum Error {
     AmountAboveMax = 22,
     InvalidExpiry = 23,
     InvalidSettlement = 24,
-    DuplicateIdempotencyKey = 24,
+    DuplicateIdempotencyKey = 25,
 }
 
 #[contracttype]
@@ -162,6 +164,42 @@ pub struct AmountLimits {
 pub struct SettlementSplit {
     pub recipient: Address,
     pub amount: i128,
+}
+
+/// Configuration for creating a payment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentConfig {
+    /// Optional memo for Stellar payment routing.
+    pub memo: Option<String>,
+    /// Optional memo type: Text, Id, Hash, or Return.
+    pub memo_type: Option<String>,
+    /// Token contract address used for this payment (None defaults to the configured USDC token).
+    pub token_address: Option<Address>,
+    /// Optional idempotency key. If provided, retrying with the same key and payment_id
+    /// returns the existing payment. Using the same key with a different payment_id
+    /// returns `DuplicateIdempotencyKey`.
+    pub client_token: Option<String>,
+}
+
+/// Recipient stream for streaming payments.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientStream {
+    pub recipient: Address,
+    pub token_address: Address,
+    pub total_amount: i128,
+    pub claimed_amount: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub last_claim_time: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+pub enum RecipientDataKey {
+    Recipient(Address),
+    RecipientStream(Address),
 }
 
 #[contracttype]
@@ -193,6 +231,8 @@ const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
 pub const DEFAULT_PAYMENT_DURATION_SECS: u64 = 3_600;
 /// 1% refund fee in basis points (100 bps = 1%).
 const REFUND_FEE_BPS: i128 = 100;
+/// Default DEX router address for swap operations.
+const DEFAULT_DEX_ROUTER: &[u8] = b"DEX_ROUTER_ADDRESS";
 
 #[contractimpl]
 #[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
@@ -1184,7 +1224,6 @@ impl PaymentProcessor {
     }
 
     #[allow(deprecated)]
-    #[allow(clippy::too_many_arguments)]
     pub fn create_payment(
         env: Env,
         payment_id: String,
@@ -1192,17 +1231,11 @@ impl PaymentProcessor {
         amount: i128,
         currency: Symbol,
         deposit_address: Address,
-        /// Absolute expiry timestamp (Unix seconds). When `None`, `duration_secs` is used.
         expires_at: Option<u64>,
-        /// Seconds from now until the payment expires. Ignored when `expires_at` is `Some`.
-        /// Defaults to `DEFAULT_PAYMENT_DURATION_SECS` (1 hour) when both are `None`.
         duration_secs: Option<u64>,
         memo: Option<String>,
         memo_type: Option<String>,
         token_address: Option<Address>,
-        /// Optional idempotency key. If provided, retrying with the same key and payment_id
-        /// returns the existing payment. Using the same key with a different payment_id
-        /// returns `DuplicateIdempotencyKey`.
         client_token: Option<String>,
     ) -> Result<PaymentCharge, Error> {
         Self::require_not_paused(&env)?;
@@ -1620,6 +1653,241 @@ impl PaymentProcessor {
         );
 
         Ok(())
+    }
+
+    /// Atomic swap and pay: swap sender's token to merchant's required token and create payment.
+    /// Integrates with DEX (e.g., Soroswap) for atomic asset conversion.
+    /// 
+    /// # Arguments
+    /// * `payer` - The address making the payment
+    /// * `payment_id` - Unique payment identifier
+    /// * `merchant_id` - Merchant's address
+    /// * `amount` - Amount in the merchant's settlement currency (after swap)
+    /// * `currency` - Settlement currency symbol
+    /// * `deposit_address` - Where the payment should be deposited
+    /// * `token_in` - Address of the token the payer is sending
+    /// * `amount_in` - Amount of token_in to swap
+    /// * `amount_out_min` - Minimum amount of settlement token required
+    /// * `path` - DEX swap path [token_in, ..., settlement_token]
+    /// * `expires_at` - Payment expiry timestamp
+    /// * `dex_router` - Address of the DEX router contract
+    /// 
+    /// # Returns
+    /// The created PaymentCharge on success
+    #[allow(clippy::too_many_arguments)]
+    pub fn swap_and_pay(
+        env: Env,
+        payer: Address,
+        payment_id: String,
+        merchant_id: Address,
+        amount: i128,
+        currency: Symbol,
+        deposit_address: Address,
+        token_in: Address,
+        amount_in: i128,
+        amount_out_min: i128,
+        path: Vec<Address>,
+        expires_at: Option<u64>,
+        dex_router: Address,
+    ) -> Result<PaymentCharge, Error> {
+        payer.require_auth();
+
+        // Validate inputs
+        if amount <= 0 || amount_in <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Clone values for swap operation since they'll be moved
+        let payment_id_clone = payment_id.clone();
+        let deposit_address_clone = deposit_address.clone();
+        let path_clone = path.clone();
+
+        // Execute atomic swap via DEX router
+        let deadline = env.ledger().timestamp().saturating_add(3_600); // 1 hour deadline
+        
+        let dex_client = DexRouterClient::new(&env, &dex_router);
+        
+        // Perform the swap - this transfers tokens from payer and sends output to deposit_address
+        let _swap_result = dex_client.swap_exact_tokens_for_tokens(
+            &amount_in,
+            &amount_out_min,
+            &path_clone,
+            &deposit_address_clone,
+            &deadline,
+        );
+
+        // Now create the payment with the swapped amount
+        let payment = Self::create_payment(
+            env.clone(),
+            payment_id_clone,
+            merchant_id,
+            amount,
+            currency,
+            deposit_address_clone.clone(),
+            expires_at,
+            None, // duration_secs
+            None, // memo
+            None, // memo_type
+            Some(deposit_address_clone), // token_address - using settlement token
+            None, // client_token
+        )?;
+
+        // Emit SWAP/AND/PAY event
+        env.events().publish(
+            (
+                Symbol::new(&env, "SWAP"),
+                Symbol::new(&env, "AND"),
+                Symbol::new(&env, "PAY"),
+            ),
+            (payment_id.clone(), payer, amount_in, token_in, amount),
+        );
+
+        Ok(payment)
+    }
+
+    /// Update recipient address for address rotation.
+    /// Allows recipients to safely rotate their receiving address.
+    /// 
+    /// # Arguments
+    /// * `recipient` - Current recipient address (for auth)
+    /// * `new_address` - New address to receive funds
+    /// 
+    /// # Returns
+    /// Ok(()) on success
+    pub fn update_recipient(
+        env: Env,
+        recipient: Address,
+        new_address: Address,
+    ) -> Result<(), Error> {
+        recipient.require_auth();
+
+        // Get existing recipient stream
+        let stream_key = RecipientDataKey::RecipientStream(recipient.clone());
+        let mut stream: RecipientStream = env
+            .storage()
+            .persistent()
+            .get(&stream_key)
+            .ok_or(Error::PaymentNotFound)?;
+
+        // Update the recipient address atomically
+        stream.recipient = new_address.clone();
+
+        // Save updated stream with new address
+        env.storage()
+            .persistent()
+            .set(&stream_key, &stream);
+
+        // Also update the RecipientDataKey mapping
+        let old_recipient_key = RecipientDataKey::Recipient(recipient.clone());
+        let new_recipient_key = RecipientDataKey::Recipient(new_address.clone());
+
+        // Move the recipient data to the new address
+        if let Some(recipient_data) = env
+            .storage()
+            .persistent()
+            .get::<RecipientDataKey, RecipientStream>(&old_recipient_key)
+        {
+            env.storage()
+                .persistent()
+                .set(&new_recipient_key, &recipient_data);
+            env.storage()
+                .persistent()
+                .remove(&old_recipient_key);
+        }
+
+        // Emit RECIPIENT/UPDATED event
+        env.events().publish(
+            (Symbol::new(&env, "RECIPIENT"), Symbol::new(&env, "UPDATED")),
+            (recipient, new_address),
+        );
+
+        Ok(())
+    }
+
+    /// Create a new recipient stream for streaming payments.
+    pub fn create_recipient_stream(
+        env: Env,
+        recipient: Address,
+        token_address: Address,
+        total_amount: i128,
+        start_time: u64,
+        duration_secs: u64,
+    ) -> Result<(), Error> {
+        recipient.require_auth();
+
+        let end_time = start_time.saturating_add(duration_secs);
+
+        let stream = RecipientStream {
+            recipient: recipient.clone(),
+            token_address,
+            total_amount,
+            claimed_amount: 0,
+            start_time,
+            end_time,
+            last_claim_time: start_time,
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&RecipientDataKey::RecipientStream(recipient.clone()), &stream);
+
+        env.events().publish(
+            (Symbol::new(&env, "RECIPIENT"), Symbol::new(&env, "STREAM_CREATED")),
+            (recipient, total_amount, end_time),
+        );
+
+        Ok(())
+    }
+
+    /// Claim available amount from a recipient stream.
+    pub fn claim_from_stream(env: Env, recipient: Address) -> Result<i128, Error> {
+        recipient.require_auth();
+
+        let stream_key = RecipientDataKey::RecipientStream(recipient.clone());
+        let mut stream: RecipientStream = env
+            .storage()
+            .persistent()
+            .get(&stream_key)
+            .ok_or(Error::PaymentNotFound)?;
+
+        if !stream.active {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < stream.start_time {
+            return Err(Error::Unauthorized);
+        }
+
+        // Calculate vested amount based on time elapsed
+        let elapsed = now.saturating_sub(stream.start_time);
+        let total_duration = stream.end_time.saturating_sub(stream.start_time);
+        
+        if total_duration == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let vested_amount = (stream.total_amount * (elapsed as i128)) / (total_duration as i128);
+        let available = vested_amount.saturating_sub(stream.claimed_amount);
+
+        if available <= 0 {
+            return Ok(0);
+        }
+
+        stream.claimed_amount = stream.claimed_amount.saturating_add(available);
+        stream.last_claim_time = now;
+
+        env.storage()
+            .persistent()
+            .set(&stream_key, &stream);
+
+        env.events().publish(
+            (Symbol::new(&env, "RECIPIENT"), Symbol::new(&env, "CLAIMED")),
+            (recipient, available),
+        );
+
+        Ok(available)
     }
 
     fn get_payment_internal(env: &Env, payment_id: &String) -> Result<PaymentCharge, Error> {
