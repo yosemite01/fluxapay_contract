@@ -23,9 +23,9 @@ impl DexRouter {
     ) -> Vec<i128> {
         // In a real implementation, this would call the router's getAmountsOut
         // Returns a vector with the same length as path, containing expected output amounts
-        let mut amounts = vec![&env; path.len() as u32];
-        for i in 0..path.len() {
-            amounts.set(i, amount_in);
+        let mut amounts = Vec::new(&env);
+        for _ in 0..path.len() {
+            amounts.push_back(amount_in);
         }
         amounts
     }
@@ -55,9 +55,9 @@ impl DexRouter {
         soroban_sdk::Symbol::new(&env, "EXECUTED");
 
         // Return the amounts (in real impl, this would be the actual output amounts)
-        let mut amounts = vec![&env; path.len() as u32];
-        for i in 0..path.len() {
-            amounts.set(i, amount_in);
+        let mut amounts = Vec::new(&env);
+        for _ in 0..path.len() {
+            amounts.push_back(amount_in);
         }
         amounts
     }
@@ -80,9 +80,9 @@ impl DexRouter {
         soroban_sdk::Symbol::new(&env, "SWAP");
         soroban_sdk::Symbol::new(&env, "EXECUTED");
 
-        let mut amounts = vec![&env; path.len() as u32];
-        for i in 0..path.len() {
-            amounts.set(i, amount_out);
+        let mut amounts = Vec::new(&env);
+        for _ in 0..path.len() {
+            amounts.push_back(amount_out);
         }
         amounts
     }

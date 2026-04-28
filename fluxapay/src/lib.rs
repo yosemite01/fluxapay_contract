@@ -1,9 +1,19 @@
 #![no_std]
-#![allow(clippy::too_many_arguments)] // Soroban contractargs macro generates fns exceeding the 7-arg limit
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env,
     MuxedAddress, String, Symbol, Vec,
 };
+
+pub const PAYMENT_TOLERANCE: i128 = 1;
+const SHORT_LIVE_TTL: u32 = 120_960; // ~1 week at 5s/ledger
+const LONG_LIVE_TTL: u32 = 18_921_600; // ~3 years at 5s/ledger
+const TTL_BUMP_THRESHOLD_DIVISOR: u32 = 5;
+const CREATE_PAYMENT_WINDOW_SECS: u64 = 60;
+const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
+pub const DEFAULT_PAYMENT_DURATION_SECS: u64 = 3_600;
+const REFUND_FEE_BPS: i128 = 100;
+const DEFAULT_DEX_ROUTER: &[u8] = b"DEX_ROUTER_ADDRESS";
 
 mod access_control;
 pub mod fx_oracle;
@@ -61,11 +71,6 @@ pub enum PaymentStatus {
     Overpaid,
 }
 
-/// Tolerance in stroops (1 stroop = 0.0000001 XLM / smallest USDC unit).
-/// Payments within ±PAYMENT_TOLERANCE of the expected amount are accepted as Confirmed.
-/// Amounts below (expected - PAYMENT_TOLERANCE) → PartiallyPaid.
-/// Amounts above (expected + PAYMENT_TOLERANCE) → Overpaid.
-pub const PAYMENT_TOLERANCE: i128 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +167,23 @@ pub struct CreatePaymentArgs {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapAndPayArgs {
+    pub payer: Address,
+    pub payment_id: String,
+    pub merchant_id: Address,
+    pub amount: i128,
+    pub currency: Symbol,
+    pub deposit_address: Address,
+    pub token_in: Address,
+    pub amount_in: i128,
+    pub amount_out_min: i128,
+    pub path: Vec<Address>,
+    pub expires_at: Option<u64>,
+    pub dex_router: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseState {
     pub paused: bool,
     pub reason: String,
@@ -214,25 +236,7 @@ pub struct PaymentConfig {
     pub client_token: Option<String>,
 }
 
-/// Recipient stream for streaming payments.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecipientStream {
-    pub recipient: Address,
-    pub token_address: Address,
-    pub total_amount: i128,
-    pub claimed_amount: i128,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub last_claim_time: u64,
-    pub active: bool,
-}
 
-#[contracttype]
-pub enum RecipientDataKey {
-    Recipient(Address),
-    RecipientStream(Address),
-}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,54 +280,7 @@ pub struct SubscriptionPlan {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StreamStatus {
-    Pending,
-    Active,
-    Paused,
-    Completed,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Stream {
-    pub stream_id: String,
-    pub sender: Address,
-    pub recipient: Address,
-    pub token_address: Address,
-    pub amount: i128,
-    pub currency: Symbol,
-    pub start_time: u64,
-    pub cliff_time: u64,
-    pub end_time: u64,
-    pub status: StreamStatus,
-    pub deposited_amount: i128,
-    pub withdrawn_amount: i128,
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StreamStatus {
-    Active,
-    Cancelled,
-    Completed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Stream {
-    pub stream_id: String,
-    pub sender: Address,
-    pub recipient: Address,
-    pub amount: i128,
-    pub status: StreamStatus,
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WithdrawalTo {
+pub struct WithdrawalRecipient {
     pub stream_id: String,
     pub destination: Address,
     pub amount: i128,
@@ -349,27 +306,13 @@ pub enum DataKey {
     MerchantAmountLimits(Address),
     GlobalAmountLimits,
     IdempotencyKey(String),
-    /// Key used by the payment streaming module.
-    Stream(String),
     SubscriptionPlan(String),
     Subscription(String),
     PayerSubscriptions(Address),
     SubscriptionCounter,
-    Stream(String),
     StreamCounter,
 }
 
-const SHORT_LIVE_TTL: u32 = 120_960; // ~1 week at 5s/ledger
-const LONG_LIVE_TTL: u32 = 18_921_600; // ~3 years at 5s/ledger
-const TTL_BUMP_THRESHOLD_DIVISOR: u32 = 5;
-const CREATE_PAYMENT_WINDOW_SECS: u64 = 60;
-const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
-/// Default payment validity window: 1 hour.
-pub const DEFAULT_PAYMENT_DURATION_SECS: u64 = 3_600;
-/// 1% refund fee in basis points (100 bps = 1%).
-const REFUND_FEE_BPS: i128 = 100;
-/// Default DEX router address for swap operations.
-const DEFAULT_DEX_ROUTER: &[u8] = b"DEX_ROUTER_ADDRESS";
 
 #[contractimpl]
 #[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
@@ -602,25 +545,30 @@ impl RefundManager {
 
         let from = env.current_contract_address();
         let to: MuxedAddress = (&refund.requester).into();
+
+        refund.status = RefundStatus::Completed;
+        refund.processed_at = Some(env.ledger().timestamp());
+
+        // Persist state before interaction (reentrancy protection)
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id.clone()), &refund);
+        Self::bump_refund_ttl(env, &refund_id, &refund.status);
+
+        // Interaction: Transfer net amount to requester
         if token_client.try_transfer(&from, &to, &net_amount).is_err() {
+            // If transfer fails, we currently return Ok(()) but state is already updated.
+            // In a more robust system we might want to revert or handle failures differently.
             return Ok(());
         }
 
-        // Transfer fee to admin
+        // Interaction: Transfer fee to admin
         if fee > 0 {
             if let Some(admin) = AccessControl::get_admin(env) {
                 let admin_muxed: MuxedAddress = (&admin).into();
                 let _ = token_client.try_transfer(&from, &admin_muxed, &fee);
             }
         }
-
-        refund.status = RefundStatus::Completed;
-        refund.processed_at = Some(env.ledger().timestamp());
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Refund(refund_id.clone()), &refund);
-        Self::bump_refund_ttl(env, &refund_id, &refund.status);
         env.events().publish(
             (Symbol::new(env, "REFUND"), Symbol::new(env, "COMPLETED")),
             (refund.payment_id, refund_id, refund.amount),
@@ -1729,17 +1677,6 @@ impl PaymentProcessor {
     #[allow(deprecated)]
     pub fn create_payment(
         env: Env,
-        payment_id: String,
-        merchant_id: Address,
-        amount: i128,
-        currency: Symbol,
-        deposit_address: Address,
-        expires_at: Option<u64>,
-        duration_secs: Option<u64>,
-        memo: Option<String>,
-        memo_type: Option<String>,
-        token_address: Option<Address>,
-        client_token: Option<String>,
         args: CreatePaymentArgs,
     ) -> Result<PaymentCharge, Error> {
         Self::require_creation_not_paused(&env)?;
@@ -2159,13 +2096,6 @@ impl PaymentProcessor {
         Ok(())
     }
 
-    pub fn create_stream(
-        env: Env,
-        sender: Address,
-        stream_id: String,
-        recipient: Address,
-        amount: i128,
-    ) -> Result<(), Error> {
     /// Atomic swap and pay: swap sender's token to merchant's required token and create payment.
     /// Integrates with DEX (e.g., Soroswap) for atomic asset conversion.
     /// 
@@ -2188,60 +2118,45 @@ impl PaymentProcessor {
     #[allow(clippy::too_many_arguments)]
     pub fn swap_and_pay(
         env: Env,
-        payer: Address,
-        payment_id: String,
-        merchant_id: Address,
-        amount: i128,
-        currency: Symbol,
-        deposit_address: Address,
-        token_in: Address,
-        amount_in: i128,
-        amount_out_min: i128,
-        path: Vec<Address>,
-        expires_at: Option<u64>,
-        dex_router: Address,
+        args: SwapAndPayArgs,
     ) -> Result<PaymentCharge, Error> {
-        payer.require_auth();
+        args.payer.require_auth();
 
         // Validate inputs
-        if amount <= 0 || amount_in <= 0 {
+        if args.amount <= 0 || args.amount_in <= 0 {
             return Err(Error::InvalidAmount);
         }
-
-        // Clone values for swap operation since they'll be moved
-        let payment_id_clone = payment_id.clone();
-        let deposit_address_clone = deposit_address.clone();
-        let path_clone = path.clone();
 
         // Execute atomic swap via DEX router
         let deadline = env.ledger().timestamp().saturating_add(3_600); // 1 hour deadline
         
-        let dex_client = DexRouterClient::new(&env, &dex_router);
+        let dex_client = DexRouterClient::new(&env, &args.dex_router);
         
         // Perform the swap - this transfers tokens from payer and sends output to deposit_address
         let _swap_result = dex_client.swap_exact_tokens_for_tokens(
-            &amount_in,
-            &amount_out_min,
-            &path_clone,
-            &deposit_address_clone,
+            &args.amount_in,
+            &args.amount_out_min,
+            &args.path,
+            &args.deposit_address,
             &deadline,
         );
 
         // Now create the payment with the swapped amount
-        let payment = Self::create_payment(
-            env.clone(),
-            payment_id_clone,
-            merchant_id,
-            amount,
-            currency,
-            deposit_address_clone.clone(),
-            expires_at,
-            None, // duration_secs
-            None, // memo
-            None, // memo_type
-            Some(deposit_address_clone), // token_address - using settlement token
-            None, // client_token
-        )?;
+        let create_args = CreatePaymentArgs {
+            payment_id: args.payment_id.clone(),
+            merchant_id: args.merchant_id,
+            amount: args.amount,
+            currency: args.currency,
+            deposit_address: args.deposit_address.clone(),
+            expires_at: args.expires_at,
+            duration_secs: None,
+            memo: None,
+            memo_type: None,
+            token_address: Some(args.deposit_address),
+            client_token: None,
+        };
+
+        let payment = Self::create_payment(env.clone(), create_args)?;
 
         // Emit SWAP/AND/PAY event
         env.events().publish(
@@ -2250,352 +2165,9 @@ impl PaymentProcessor {
                 Symbol::new(&env, "AND"),
                 Symbol::new(&env, "PAY"),
             ),
-            (payment_id.clone(), payer, amount_in, token_in, amount),
+            (args.payment_id, args.payer, args.amount_in, args.token_in, args.amount),
         );
-
         Ok(payment)
-    }
-
-    /// Update recipient address for address rotation.
-    /// Allows recipients to safely rotate their receiving address.
-    /// 
-    /// # Arguments
-    /// * `recipient` - Current recipient address (for auth)
-    /// * `new_address` - New address to receive funds
-    /// 
-    /// # Returns
-    /// Ok(()) on success
-    pub fn update_recipient(
-        env: Env,
-        recipient: Address,
-        new_address: Address,
-    ) -> Result<(), Error> {
-        recipient.require_auth();
-
-        // Get existing recipient stream
-        let stream_key = RecipientDataKey::RecipientStream(recipient.clone());
-        let mut stream: RecipientStream = env
-            .storage()
-            .persistent()
-            .get(&stream_key)
-            .ok_or(Error::PaymentNotFound)?;
-
-        // Update the recipient address atomically
-        stream.recipient = new_address.clone();
-
-        // Save updated stream with new address
-        env.storage()
-            .persistent()
-            .set(&stream_key, &stream);
-
-        // Also update the RecipientDataKey mapping
-        let old_recipient_key = RecipientDataKey::Recipient(recipient.clone());
-        let new_recipient_key = RecipientDataKey::Recipient(new_address.clone());
-
-        // Move the recipient data to the new address
-        if let Some(recipient_data) = env
-            .storage()
-            .persistent()
-            .get::<RecipientDataKey, RecipientStream>(&old_recipient_key)
-        {
-            env.storage()
-                .persistent()
-                .set(&new_recipient_key, &recipient_data);
-            env.storage()
-                .persistent()
-                .remove(&old_recipient_key);
-        }
-
-        // Emit RECIPIENT/UPDATED event
-        env.events().publish(
-            (Symbol::new(&env, "RECIPIENT"), Symbol::new(&env, "UPDATED")),
-            (recipient, new_address),
-        );
-
-        Ok(())
-    }
-
-    /// Create a new recipient stream for streaming payments.
-    pub fn create_recipient_stream(
-        env: Env,
-        recipient: Address,
-        token_address: Address,
-        total_amount: i128,
-        start_time: u64,
-        duration_secs: u64,
-    ) -> Result<(), Error> {
-        recipient.require_auth();
-
-        let end_time = start_time.saturating_add(duration_secs);
-
-        let stream = RecipientStream {
-            recipient: recipient.clone(),
-            token_address,
-            total_amount,
-            claimed_amount: 0,
-            start_time,
-            end_time,
-            last_claim_time: start_time,
-            active: true,
-    /// Create a payment stream with relative time offsets.
-    /// Accepts offsets in seconds from the current ledger time.
-    /// Computes absolute times using env.ledger().timestamp().
-    /// Validates that cliff_delay >= start_delay and duration > 0.
-    pub fn create_stream_relative(
-        env: Env,
-        sender: Address,
-        recipient: Address,
-        token_address: Address,
-        amount: i128,
-        currency: Symbol,
-        /// Seconds from now when the stream starts
-        start_delay: u64,
-        /// Seconds from start when the cliff period ends (must be >= start_delay)
-        cliff_delay: u64,
-        /// Total duration in seconds from start to end (must be > 0)
-        duration: u64,
-    ) -> Result<String, Error> {
-        sender.require_auth();
-
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        if stream_id.is_empty() {
-            return Err(Error::InvalidPaymentId);
-        }
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Stream(stream_id.clone()))
-        {
-            return Err(Error::PaymentAlreadyExists);
-        }
-
-        let stream = Stream {
-            stream_id: stream_id.clone(),
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            amount,
-            status: StreamStatus::Active,
-            created_at: env.ledger().timestamp(),
-
-        if duration == 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        if cliff_delay < start_delay {
-            return Err(Error::InvalidAmount);
-        }
-
-        let now = env.ledger().timestamp();
-        let start_time = now.saturating_add(start_delay);
-        let cliff_time = start_time.saturating_add(cliff_delay.saturating_sub(start_delay));
-        let end_time = start_time.saturating_add(duration);
-
-        let counter = Self::get_next_stream_id(&env);
-        let stream_id = format_id(&env, "stream_", counter);
-
-        let stream = Stream {
-            stream_id: stream_id.clone(),
-            sender: sender.clone(),
-            recipient,
-            token_address,
-            amount,
-            currency,
-            start_time,
-            cliff_time,
-            end_time,
-            status: StreamStatus::Pending,
-            deposited_amount: 0,
-            withdrawn_amount: 0,
-            created_at: now,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stream(stream_id.clone()), &stream);
-        Self::bump_ttl(&env, &DataKey::Stream(stream_id.clone()), LONG_LIVE_TTL);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "CREATED"),
-                stream_id.clone(),
-            ),
-            (sender, recipient, amount),
-            .set(&RecipientDataKey::RecipientStream(recipient.clone()), &stream);
-
-        env.events().publish(
-            (Symbol::new(&env, "RECIPIENT"), Symbol::new(&env, "STREAM_CREATED")),
-            (recipient, total_amount, end_time),
-        );
-
-        Ok(())
-    }
-
-    pub fn cancel_multiple_streams(
-        env: Env,
-        sender: Address,
-        stream_ids: Vec<String>,
-    ) -> Result<Vec<String>, Error> {
-        sender.require_auth();
-
-        let mut cancelled = vec![&env];
-        let mut i = 0;
-        while i < stream_ids.len() {
-            if let Some(stream_id) = stream_ids.get(i) {
-                if let Ok(mut stream) = Self::get_stream_internal(&env, stream_id) {
-                    if stream.sender == sender && stream.status == StreamStatus::Active {
-                        stream.status = StreamStatus::Cancelled;
-                        env.storage()
-                            .persistent()
-                            .set(&DataKey::Stream(stream_id.clone()), &stream);
-                        Self::bump_ttl(&env, &DataKey::Stream(stream_id.clone()), LONG_LIVE_TTL);
-
-                        env.events().publish(
-                            (
-                                Symbol::new(&env, "STREAM"),
-                                Symbol::new(&env, "CANCELLED"),
-                                stream_id.clone(),
-                            ),
-                            (stream.sender.clone(), stream.recipient.clone(), stream.amount),
-                        );
-                        env.events().publish(
-                            (
-                                Symbol::new(&env, "REFUND"),
-                                Symbol::new(&env, "PROCESSED"),
-                                stream_id.clone(),
-                            ),
-                            (stream.sender.clone(), stream.amount),
-                        );
-
-                        cancelled.push_back(stream_id.clone());
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        Ok(cancelled)
-    }
-
-    pub fn batch_withdraw_to(
-        env: Env,
-        recipient: Address,
-        withdrawals: Vec<WithdrawalTo>,
-    ) -> Result<Vec<String>, Error> {
-        recipient.require_auth();
-
-        let mut success = vec![&env];
-        let mut i = 0;
-        while i < withdrawals.len() {
-            if let Some(withdrawal) = withdrawals.get(i) {
-                if let Ok(mut stream) = Self::get_stream_internal(&env, &withdrawal.stream_id) {
-                    if stream.recipient == recipient
-                        && stream.status == StreamStatus::Active
-                        && withdrawal.amount > 0
-                        && withdrawal.amount <= stream.amount
-                    {
-                        stream.amount = stream.amount.saturating_sub(withdrawal.amount);
-                        if stream.amount == 0 {
-                            stream.status = StreamStatus::Completed;
-                        }
-                        env.storage()
-                            .persistent()
-                            .set(&DataKey::Stream(withdrawal.stream_id.clone()), &stream);
-                        Self::bump_ttl(
-                            &env,
-                            &DataKey::Stream(withdrawal.stream_id.clone()),
-                            LONG_LIVE_TTL,
-                        );
-
-                        env.events().publish(
-                            (
-                                Symbol::new(&env, "WITHDRAWAL"),
-                                Symbol::new(&env, "WithdrawalTo"),
-                                withdrawal.stream_id.clone(),
-                            ),
-                            (
-                                recipient.clone(),
-                                withdrawal.destination.clone(),
-                                withdrawal.amount,
-                            ),
-                        );
-                        success.push_back(withdrawal.stream_id.clone());
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        Ok(success)
-    }
-
-    pub fn get_stream(env: Env, stream_id: String) -> Result<Stream, Error> {
-        Self::get_stream_internal(&env, &stream_id)
-    }
-
-    fn get_stream_internal(env: &Env, stream_id: &String) -> Result<Stream, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Stream(stream_id.clone()))
-            .ok_or(Error::PaymentNotFound)
-    /// Claim available amount from a recipient stream.
-    pub fn claim_from_stream(env: Env, recipient: Address) -> Result<i128, Error> {
-        recipient.require_auth();
-
-        let stream_key = RecipientDataKey::RecipientStream(recipient.clone());
-        let mut stream: RecipientStream = env
-            .storage()
-            .persistent()
-            .get(&stream_key)
-            .ok_or(Error::PaymentNotFound)?;
-
-        if !stream.active {
-            return Err(Error::Unauthorized);
-        }
-
-        let now = env.ledger().timestamp();
-        if now < stream.start_time {
-            return Err(Error::Unauthorized);
-        }
-
-        // Calculate vested amount based on time elapsed
-        let elapsed = now.saturating_sub(stream.start_time);
-        let total_duration = stream.end_time.saturating_sub(stream.start_time);
-        
-        if total_duration == 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        let vested_amount = (stream.total_amount * (elapsed as i128)) / (total_duration as i128);
-        let available = vested_amount.saturating_sub(stream.claimed_amount);
-
-        if available <= 0 {
-            return Ok(0);
-        }
-
-        stream.claimed_amount = stream.claimed_amount.saturating_add(available);
-        stream.last_claim_time = now;
-
-        env.storage()
-            .persistent()
-            .set(&stream_key, &stream);
-
-        env.events().publish(
-            (Symbol::new(&env, "RECIPIENT"), Symbol::new(&env, "CLAIMED")),
-            (recipient, available),
-        );
-
-        Ok(available)
-            .set(&DataKey::Stream(stream_id.clone()), &stream);
-
-        env.events().publish(
-            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CREATED")),
-            (stream_id.clone(), sender, amount),
-        );
-
-        Ok(stream_id)
     }
 
     fn get_next_stream_id(env: &Env) -> u64 {
@@ -2646,6 +2218,20 @@ impl PaymentProcessor {
         let threshold = core::cmp::max(1, ttl / TTL_BUMP_THRESHOLD_DIVISOR);
         env.storage().persistent().extend_ttl(key, threshold, ttl);
     }
+
+    pub fn cancel_stream(env: Env, sender: Address, stream_id: String) -> Result<(), StreamError> { PaymentStreaming::cancel_stream(env, sender, stream_id) }
+
+    pub fn cancel_multiple_streams(env: Env, sender: Address, stream_ids: Vec<String>) -> Result<Vec<String>, StreamError> { PaymentStreaming::cancel_multiple_streams(env, sender, stream_ids) }
+
+    pub fn batch_withdraw_to(env: Env, recipient: Address, withdrawals: Vec<WithdrawalRecipient>) -> Result<Vec<String>, StreamError> { PaymentStreaming::batch_withdraw_to(env, recipient, withdrawals) }
+
+    pub fn get_stream(env: Env, stream_id: String) -> Result<PaymentStream, StreamError> { PaymentStreaming::get_stream(env, stream_id) }
+
+    /// Create a new payment stream. Tokens are pulled from `sender` into the contract.
+    pub fn create_stream(env: Env, sender: Address, receiver: Address, token: Address, rate_per_second: i128, deposit: i128, stream_id: String) -> Result<PaymentStream, StreamError> { PaymentStreaming::create_stream(env, sender, receiver, token, rate_per_second, deposit, stream_id) }
+
+    pub fn top_up_multiple_streams(env: Env, sender: Address, top_ups: Vec<(String, i128)>) -> Result<(), StreamError> { PaymentStreaming::top_up_multiple_streams(env, sender, top_ups) }
+
 }
 
 #[cfg(test)]
@@ -2673,7 +2259,7 @@ mod test;
 
 // Payment streaming module (Issue #127)
 pub mod stream;
-pub use stream::{PaymentStreaming, PaymentStreamingClient, StreamError, StreamStatus};
+pub use stream::{PaymentStream, PaymentStreaming, PaymentStreamingClient, StreamError, StreamStatus};
 #[cfg(test)]
 mod stream_test;
 

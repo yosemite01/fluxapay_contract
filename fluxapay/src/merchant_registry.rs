@@ -21,11 +21,48 @@ pub enum KycTier {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeConfig {
     /// Platform fee in basis points (100 bps = 1%). 0 means no fee.
-    pub platform_fee_bps: i32,
+    pub platform_fee_bps: i64,
     /// Fixed fee per transaction in the smallest currency unit.
     pub fixed_fee: i128,
     /// Optional: custom fee recipient address (defaults to admin if None).
     pub fee_recipient: Option<Address>,
+}
+
+/// Soroban-compatible nullable wrapper for FeeConfig.
+///
+/// Soroban's `#[contracttype]` macro does not support `Option<T>` when `T`
+/// is itself a `#[contracttype]` struct (because structs implement `TryFrom`
+/// rather than `From` for `ScVal`). Using an enum is the idiomatic pattern.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaybeFeeConfig {
+    None,
+    Some(FeeConfig),
+}
+
+impl MaybeFeeConfig {
+    pub fn as_option(&self) -> Option<&FeeConfig> {
+        match self {
+            MaybeFeeConfig::Some(ref c) => Some(c),
+            MaybeFeeConfig::None => None,
+        }
+    }
+
+    pub fn into_option(self) -> Option<FeeConfig> {
+        match self {
+            MaybeFeeConfig::Some(c) => Some(c),
+            MaybeFeeConfig::None => None,
+        }
+    }
+}
+
+impl From<Option<FeeConfig>> for MaybeFeeConfig {
+    fn from(opt: Option<FeeConfig>) -> Self {
+        match opt {
+            Some(c) => MaybeFeeConfig::Some(c),
+            None => MaybeFeeConfig::None,
+        }
+    }
 }
 
 #[contracttype]
@@ -45,7 +82,7 @@ pub struct Merchant {
     pub suspension_reason: Option<String>,
     pub suspended_at: Option<u64>,
     /// Custom fee configuration for this merchant.
-    pub fee_config: Option<FeeConfig>,
+    pub fee_config: MaybeFeeConfig,
 }
 
 #[contracttype]
@@ -118,7 +155,7 @@ impl MerchantRegistry {
             created_at: env.ledger().timestamp(),
             suspension_reason: None,
             suspended_at: None,
-            fee_config,
+            fee_config: MaybeFeeConfig::from(fee_config),
         };
 
         env.storage()
@@ -161,7 +198,7 @@ impl MerchantRegistry {
             merchant.bank_account = Some(acct);
         }
         if let Some(config) = fee_config {
-            merchant.fee_config = Some(config);
+            merchant.fee_config = MaybeFeeConfig::Some(config);
         }
 
         env.storage()
@@ -432,18 +469,18 @@ impl MerchantRegistry {
     /// Returns (platform_fee, net_amount).
     pub fn calculate_fee(env: Env, merchant_id: Address, amount: i128) -> Result<(i128, i128), MerchantError> {
         let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
-        
-        if let Some(ref config) = merchant.fee_config {
+
+        if let Some(ref config) = merchant.fee_config.as_option() {
             if config.platform_fee_bps == 0 && config.fixed_fee == 0 {
                 return Ok((0, amount));
             }
 
             // Calculate percentage fee
             let percentage_fee = (amount * (config.platform_fee_bps as i128)) / 10_000;
-            
+
             // Total fee is percentage + fixed
             let total_fee = percentage_fee.saturating_add(config.fixed_fee);
-            
+
             // Ensure fee doesn't exceed amount
             if total_fee >= amount {
                 return Ok((amount, 0));
@@ -462,7 +499,7 @@ impl MerchantRegistry {
     pub fn get_fee_recipient(env: Env, merchant_id: Address) -> Result<Address, MerchantError> {
         let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
         
-        if let Some(ref config) = merchant.fee_config {
+        if let MaybeFeeConfig::Some(config) = merchant.fee_config {
             if let Some(recipient) = &config.fee_recipient {
                 return Ok(recipient.clone());
             }

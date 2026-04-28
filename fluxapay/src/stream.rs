@@ -1,4 +1,6 @@
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, String, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec,
+};
 
 // ─── Data types ───────────────────────────────────────────────────────────────
 
@@ -126,16 +128,12 @@ impl PaymentStreaming {
             return Err(StreamError::StreamAlreadyExists);
         }
 
-        // Transfer deposit from sender into this contract.
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&sender, &env.current_contract_address(), &deposit);
-
         let now = env.ledger().timestamp();
         let stream = PaymentStream {
             stream_id: stream_id.clone(),
             sender,
             receiver,
-            token,
+            token: token.clone(),
             rate_per_second,
             remaining_deposit: deposit,
             last_checkpoint_at: now,
@@ -143,9 +141,14 @@ impl PaymentStreaming {
             status: StreamStatus::Active,
         };
 
+        // Persist state before interaction (reentrancy protection)
         env.storage()
             .persistent()
             .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        // Interaction: Transfer deposit from sender into this contract.
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&stream.sender, &env.current_contract_address(), &deposit);
 
         env.events().publish(
             (
@@ -254,19 +257,16 @@ impl PaymentStreaming {
         // Apply the new rate.
         stream.rate_per_second = new_rate;
 
-        // Deduct surplus from remaining deposit.
-        if surplus > 0 {
-            stream.remaining_deposit = stream.remaining_deposit.saturating_sub(surplus);
-
-            // Transfer surplus back to sender.
-            let token_client = token::Client::new(&env, &stream.token);
-            token_client.transfer(&env.current_contract_address(), &stream.sender, &surplus);
-        }
-
-        // ── Persist updated stream ────────────────────────────────────────────
+        // Persist state before interaction (reentrancy protection)
         env.storage()
             .persistent()
             .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        // Interaction: Transfer surplus back to sender.
+        if surplus > 0 {
+            let token_client = token::Client::new(&env, &stream.token);
+            token_client.transfer(&env.current_contract_address(), &stream.sender, &surplus);
+        }
 
         // ── Step 3: Emit RateDecreased event ─────────────────────────────────
         env.events().publish(
@@ -314,5 +314,300 @@ impl PaymentStreaming {
             .min(stream.remaining_deposit);
 
         Ok(total)
+    }
+
+    /// Top up multiple streams in a single atomic transaction.
+    ///
+    /// The caller (sender) must be the sender of ALL specified streams.
+    ///
+    /// # Parameters
+    /// * `sender`     – Must be the sender of all streams; must sign.
+    /// * `top_ups`    – Vector of (stream_id, amount) tuples.
+    pub fn top_up_multiple_streams(
+        env: Env,
+        sender: Address,
+        top_ups: Vec<(String, i128)>,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        for top_up in top_ups.iter() {
+            let (stream_id, amount) = top_up;
+            if amount <= 0 {
+                return Err(StreamError::InvalidDeposit);
+            }
+
+            let mut stream: PaymentStream = env
+                .storage()
+                .persistent()
+                .get(&StreamDataKey::Stream(stream_id.clone()))
+                .ok_or(StreamError::StreamNotFound)?;
+
+            if stream.sender != sender {
+                return Err(StreamError::Unauthorized);
+            }
+            if stream.status != StreamStatus::Active {
+                return Err(StreamError::StreamNotActive);
+            }
+
+            // Effects
+            stream.remaining_deposit = stream.remaining_deposit.saturating_add(amount);
+            
+            // Persist state before interaction
+            env.storage()
+                .persistent()
+                .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+            // Interaction
+            let token_client = token::Client::new(&env, &stream.token);
+            token_client.transfer(&sender, &env.current_contract_address(), &amount);
+
+            // Event
+            env.events().publish(
+                (
+                    Symbol::new(&env, "STREAM"),
+                    Symbol::new(&env, "TOPPED_UP"),
+                    stream_id,
+                ),
+                (sender.clone(), amount),
+            );
+        }
+
+        Ok(())
+    }
+
+    // ─── Stream cancellation ──────────────────────────────────────────────────
+
+    /// Cancel an active stream and refund any remaining un-accrued deposit to
+    /// the sender.
+    ///
+    /// # Parameters
+    /// * `sender`    – Must be the original stream sender; must sign.
+    /// * `stream_id` – Stream to cancel.
+    pub fn cancel_stream(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+        if stream.status != StreamStatus::Active {
+            return Err(StreamError::StreamNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Checkpoint accrued amount up to now
+        let elapsed = now.saturating_sub(stream.last_checkpoint_at);
+        let newly_accrued = (elapsed as i128)
+            .saturating_mul(stream.rate_per_second)
+            .min(stream.remaining_deposit - stream.accrued_at_checkpoint);
+        stream.accrued_at_checkpoint = stream.accrued_at_checkpoint.saturating_add(newly_accrued);
+        stream.last_checkpoint_at = now;
+
+        let accrued = stream.accrued_at_checkpoint;
+        let refund = stream.remaining_deposit.saturating_sub(accrued);
+
+        // Effects: mark cancelled
+        stream.status = StreamStatus::Cancelled;
+        stream.remaining_deposit = accrued; // only accrued portion remains
+
+        // Persist before interaction (CEI pattern)
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        // Interaction: send accrued amount to receiver, refund to sender
+        let token_client = token::Client::new(&env, &stream.token);
+        if accrued > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &stream.receiver,
+                &accrued,
+            );
+        }
+        if refund > 0 {
+            token_client.transfer(&env.current_contract_address(), &stream.sender, &refund);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "STREAM"),
+                Symbol::new(&env, "CANCELLED"),
+                stream_id,
+            ),
+            (sender, accrued, refund),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel multiple streams atomically.
+    ///
+    /// Each stream is cancelled in order; if any stream fails the whole call
+    /// reverts.  Returns the list of cancelled stream IDs.
+    ///
+    /// # Parameters
+    /// * `sender`     – Must be the sender of all streams; must sign.
+    /// * `stream_ids` – IDs of streams to cancel.
+    pub fn cancel_multiple_streams(
+        env: Env,
+        sender: Address,
+        stream_ids: Vec<String>,
+    ) -> Result<Vec<String>, StreamError> {
+        sender.require_auth();
+
+        let mut cancelled = Vec::new(&env);
+        for stream_id in stream_ids.iter() {
+            let mut stream: PaymentStream = env
+                .storage()
+                .persistent()
+                .get(&StreamDataKey::Stream(stream_id.clone()))
+                .ok_or(StreamError::StreamNotFound)?;
+
+            if stream.sender != sender {
+                return Err(StreamError::Unauthorized);
+            }
+            if stream.status != StreamStatus::Active {
+                return Err(StreamError::StreamNotActive);
+            }
+
+            let now = env.ledger().timestamp();
+            let elapsed = now.saturating_sub(stream.last_checkpoint_at);
+            let newly_accrued = (elapsed as i128)
+                .saturating_mul(stream.rate_per_second)
+                .min(stream.remaining_deposit - stream.accrued_at_checkpoint);
+            stream.accrued_at_checkpoint =
+                stream.accrued_at_checkpoint.saturating_add(newly_accrued);
+            stream.last_checkpoint_at = now;
+
+            let accrued = stream.accrued_at_checkpoint;
+            let refund = stream.remaining_deposit.saturating_sub(accrued);
+
+            // Effects
+            stream.status = StreamStatus::Cancelled;
+            stream.remaining_deposit = accrued;
+            env.storage()
+                .persistent()
+                .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+            // Interactions
+            let token_client = token::Client::new(&env, &stream.token);
+            if accrued > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &stream.receiver,
+                    &accrued,
+                );
+            }
+            if refund > 0 {
+                token_client.transfer(&env.current_contract_address(), &stream.sender, &refund);
+            }
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "STREAM"),
+                    Symbol::new(&env, "CANCELLED"),
+                    stream_id.clone(),
+                ),
+                (sender.clone(), accrued, refund),
+            );
+
+            cancelled.push_back(stream_id);
+        }
+
+        Ok(cancelled)
+    }
+
+    // ─── Batch withdrawal ─────────────────────────────────────────────────────
+
+    /// Withdraw accrued amounts from multiple streams to specified destinations
+    /// in a single transaction.
+    ///
+    /// The caller must be the receiver of each stream.  Returns the list of
+    /// stream IDs that were processed.
+    ///
+    /// # Parameters
+    /// * `recipient`   – Must be the receiver of all streams; must sign.
+    /// * `withdrawals` – Vector of `WithdrawalRecipient` (stream_id, destination, amount).
+    pub fn batch_withdraw_to(
+        env: Env,
+        recipient: Address,
+        withdrawals: Vec<crate::WithdrawalRecipient>,
+    ) -> Result<Vec<String>, StreamError> {
+        recipient.require_auth();
+
+        let mut processed = Vec::new(&env);
+        for w in withdrawals.iter() {
+            let mut stream: PaymentStream = env
+                .storage()
+                .persistent()
+                .get(&StreamDataKey::Stream(w.stream_id.clone()))
+                .ok_or(StreamError::StreamNotFound)?;
+
+            if stream.receiver != recipient {
+                return Err(StreamError::Unauthorized);
+            }
+            if stream.status != StreamStatus::Active {
+                return Err(StreamError::StreamNotActive);
+            }
+
+            // Recompute accrued up to now
+            let now = env.ledger().timestamp();
+            let elapsed = now.saturating_sub(stream.last_checkpoint_at);
+            let newly_accrued = (elapsed as i128)
+                .saturating_mul(stream.rate_per_second)
+                .min(stream.remaining_deposit - stream.accrued_at_checkpoint);
+            stream.accrued_at_checkpoint =
+                stream.accrued_at_checkpoint.saturating_add(newly_accrued);
+            stream.last_checkpoint_at = now;
+
+            let withdrawable = stream.accrued_at_checkpoint.min(w.amount).max(0);
+            if withdrawable == 0 {
+                continue;
+            }
+
+            // Effects
+            stream.accrued_at_checkpoint =
+                stream.accrued_at_checkpoint.saturating_sub(withdrawable);
+            stream.remaining_deposit = stream.remaining_deposit.saturating_sub(withdrawable);
+
+            if stream.remaining_deposit == 0 {
+                stream.status = StreamStatus::Exhausted;
+            }
+
+            env.storage()
+                .persistent()
+                .set(&StreamDataKey::Stream(w.stream_id.clone()), &stream);
+
+            // Interaction
+            let token_client = token::Client::new(&env, &stream.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &w.destination,
+                &withdrawable,
+            );
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "STREAM"),
+                    Symbol::new(&env, "WITHDRAWN"),
+                    w.stream_id.clone(),
+                ),
+                (recipient.clone(), w.destination.clone(), withdrawable),
+            );
+
+            processed.push_back(w.stream_id.clone());
+        }
+
+        Ok(processed)
     }
 }

@@ -1,7 +1,9 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, vec, Address, Env, MuxedAddress, String, Symbol,
-    Vec,
+    contract, contractimpl, contracttype, token, vec, Address, Env, Map, MuxedAddress, String,
+    Symbol, Vec,
 };
+
+use crate::PAYMENT_TOLERANCE;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

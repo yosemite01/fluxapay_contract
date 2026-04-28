@@ -55,6 +55,7 @@ fn test_happy_path_flow() {
         &String::from_str(&env, "USD"),
         &None::<Address>,
         &None::<String>,
+        &None,
     );
     merchant_client.verify_merchant(&admin, &merchant);
     let merchant_info = merchant_client.get_merchant(&merchant);

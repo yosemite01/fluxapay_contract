@@ -22,6 +22,7 @@ fn test_merchant_registration() {
         &settlement_currency,
         &Some(payout_addr.clone()),
         &Some(String::from_str(&env, "BANK-001")),
+        &None,
     );
 
     let merchant = client.get_merchant(&merchant_id);
@@ -58,6 +59,7 @@ fn test_merchant_update() {
         &settlement_currency,
         &None,
         &None,
+        &None,
     );
 
     let new_name = String::from_str(&env, "New name");
@@ -71,6 +73,7 @@ fn test_merchant_update() {
         &Some(false),
         &Some(new_payout.clone()),
         &Some(String::from_str(&env, "BANK-002")),
+        &None,
     );
 
     let updated_merchant = client.get_merchant(&merchant_id);
@@ -104,6 +107,7 @@ fn test_merchant_verification() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
 
     // verify_merchant sets KycTier::Basic for backward compatibility
@@ -134,6 +138,7 @@ fn test_unauthorized_verification() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
 
     // Attacker tries to verify the merchant
@@ -158,6 +163,7 @@ fn test_set_kyc_tier() {
         &String::from_str(&env, "USDC"),
         &None::<Address>,
         &None::<String>,
+        &None,
     );
 
     // Promote through tiers
@@ -191,6 +197,7 @@ fn test_set_kyc_tier_unauthorized() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
 
     // Non-admin tries to set KYC tier
@@ -219,6 +226,7 @@ fn test_merchant_enumeration() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
     client.register_merchant(
         &merchant2,
@@ -226,11 +234,13 @@ fn test_merchant_enumeration() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
     client.register_merchant(
         &merchant3,
         &String::from_str(&env, "Merchant 3"),
         &String::from_str(&env, "USDC"),
+        &None,
         &None,
         &None,
     );
@@ -269,6 +279,7 @@ fn test_verified_merchants_filter() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
     client.register_merchant(
         &merchant2,
@@ -276,11 +287,13 @@ fn test_verified_merchants_filter() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
     client.register_merchant(
         &merchant3,
         &String::from_str(&env, "Merchant 3"),
         &String::from_str(&env, "USDC"),
+        &None,
         &None,
         &None,
     );
@@ -326,6 +339,7 @@ fn test_unverified_merchant_cannot_create_payment() {
         &merchant,
         &String::from_str(&env, "Unverified Merchant"),
         &String::from_str(&env, "USDC"),
+        &None,
         &None,
         &None,
     );
@@ -384,6 +398,7 @@ fn test_verified_merchant_can_create_payment() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
 
     // Manually grant MERCHANT role (simulating what would happen with set_refund_manager_address)
@@ -433,6 +448,7 @@ fn test_suspend_merchant() {
         &String::from_str(&env, "USDC"),
         &None,
         &None,
+        &None,
     );
 
     let reason = String::from_str(&env, "Fraudulent activity");
@@ -461,6 +477,7 @@ fn test_reinstate_merchant() {
         &merchant_id,
         &String::from_str(&env, "Merchant"),
         &String::from_str(&env, "USDC"),
+        &None,
         &None,
         &None,
     );
@@ -499,6 +516,7 @@ fn test_suspend_merchant_unauthorized() {
         &merchant_id,
         &String::from_str(&env, "Merchant"),
         &String::from_str(&env, "USDC"),
+        &None,
         &None,
         &None,
     );

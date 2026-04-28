@@ -30,7 +30,7 @@ fn test_create_link() {
         &description,
         &None,
         &None,
-        &false,
+        &false, &None,
     );
 
     assert_eq!(id, link_id);
@@ -58,7 +58,7 @@ fn test_use_link_fixed_amount() {
         &String::from_str(&env, "Fixed"),
         &None,
         &None,
-        &false,
+        &false, &None,
     );
 
     let payment_id = client.use_link(&payer, &link_id, &amount, &None);
@@ -85,7 +85,7 @@ fn test_use_link_wrong_amount() {
         &String::from_str(&env, "Fixed"),
         &None,
         &None,
-        &false,
+        &false, &None,
     );
 
     client.use_link(&payer, &link_id, &500i128, &None);
@@ -107,7 +107,7 @@ fn test_use_link_open_amount() {
         &String::from_str(&env, "Open"),
         &None,
         &None,
-        &false,
+        &false, &None,
     );
 
     client.use_link(&payer, &link_id, &1500i128, &None);
@@ -130,7 +130,7 @@ fn test_deactivate_link() {
         &String::from_str(&env, "Bye"),
         &None,
         &None,
-        &false,
+        &false, &None,
     );
 
     client.deactivate_link(&merchant, &link_id);
@@ -156,7 +156,7 @@ fn test_link_expired() {
         &String::from_str(&env, "Old"),
         &Some(expiry),
         &None,
-        &false,
+        &false, &None,
     );
 
     env.ledger().set_timestamp(expiry + 1);
@@ -180,7 +180,7 @@ fn test_max_uses() {
         &String::from_str(&env, "Limit"),
         &None,
         &Some(1),
-        &false,
+        &false, &None,
     );
 
     client.use_link(&payer, &link_id, &100i128, &None);
@@ -217,7 +217,7 @@ fn test_direct_transfer_link_transfers_to_merchant() {
         &String::from_str(&env, "Direct"),
         &None,
         &None,
-        &true, // direct_transfer = true
+        &true, &None, // direct_transfer = true
     );
 
     let link = client.get_link(&link_id);
@@ -250,7 +250,7 @@ fn test_direct_transfer_without_token_address_fails() {
         &String::from_str(&env, "Direct no token"),
         &None,
         &None,
-        &true,
+        &true, &None,
     );
 
     // Should fail because usdc_token is None but direct_transfer is true
