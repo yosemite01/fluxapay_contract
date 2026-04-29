@@ -31,7 +31,7 @@ fn setup_payment_processor(env: &Env) -> (Address, PaymentProcessorClient<'_>) {
     let contract_id = env.register(PaymentProcessor, ());
     let client = PaymentProcessorClient::new(env, &contract_id);
     let admin = Address::generate(env);
-    client.initialize_payment_processor(&admin);
+    client.initialize_payment_processor(&admin).unwrap();
     (admin, client)
 }
 
@@ -553,10 +553,60 @@ fn test_initialize_contract() {
 
     let contract_id = env.register(RefundManager, ());
     let client = RefundManagerClient::new(&env, &contract_id);
-    client.initialize_refund_manager(&admin, &usdc_token);
+    client.initialize_refund_manager(&admin, &usdc_token).unwrap();
 
     assert_eq!(client.get_admin(), Some(admin.clone()));
     assert!(client.has_role(&role_admin(&env), &admin));
+}
+
+#[test]
+fn test_initialize_refund_manager_rejects_duplicate_admin_and_token() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let usdc_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(RefundManager, ());
+    let client = RefundManagerClient::new(&env, &contract_id);
+
+    let result = client.try_initialize_refund_manager(&admin, &admin);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+}
+
+#[test]
+fn test_initialize_refund_manager_rejects_zero_addresses() {
+    let env = Env::default();
+    let admin = Address::from_contract_id(
+        &env,
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
+    let token_admin = Address::generate(&env);
+    let usdc_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(RefundManager, ());
+    let client = RefundManagerClient::new(&env, &contract_id);
+
+    let result = client.try_initialize_refund_manager(&admin, &usdc_token);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+}
+
+#[test]
+fn test_initialize_payment_processor_rejects_zero_admin() {
+    let env = Env::default();
+    let admin = Address::from_contract_id(
+        &env,
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
+
+    let contract_id = env.register(PaymentProcessor, ());
+    let client = PaymentProcessorClient::new(&env, &contract_id);
+
+    let result = client.try_initialize_payment_processor(&admin);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
 }
 
 #[test]

@@ -147,6 +147,7 @@ pub enum Error {
     InvalidExpiry = 23,
     InvalidSettlement = 24,
     DuplicateIdempotencyKey = 25,
+    InvalidAddress = 26,
 }
 
 #[contracttype]
@@ -321,11 +322,36 @@ impl RefundManager {
         1
     }
 
-    pub fn initialize_refund_manager(env: Env, admin: Address, usdc_token_address: Address) {
+    fn validate_init_address(env: &Env, address: Address) -> Result<(), Error> {
+        let zero_address = Address::from_contract_id(
+            &env,
+            &BytesN::from_array(&env, &[0u8; 32]),
+        );
+        if address == zero_address {
+            return Err(Error::InvalidAddress);
+        }
+        Ok(())
+    }
+
+    fn validate_admin_and_token(env: &Env, admin: Address, token_address: Address) -> Result<(), Error> {
+        if admin == token_address {
+            return Err(Error::InvalidAddress);
+        }
+        Self::validate_init_address(env, admin)?;
+        Self::validate_init_address(env, token_address)
+    }
+
+    pub fn initialize_refund_manager(
+        env: Env,
+        admin: Address,
+        usdc_token_address: Address,
+    ) -> Result<(), Error> {
+        Self::validate_admin_and_token(&env, admin.clone(), usdc_token_address.clone())?;
         AccessControl::initialize(&env, admin);
         env.storage()
             .persistent()
             .set(&DataKey::UsdcToken, &usdc_token_address);
+        Ok(())
     }
 
     pub fn grant_role(
@@ -1368,7 +1394,19 @@ impl PaymentProcessor {
         1
     }
 
-    pub fn initialize_payment_processor(env: Env, admin: Address) {
+    fn validate_init_admin(env: &Env, admin: Address) -> Result<(), Error> {
+        let zero_address = Address::from_contract_id(
+            &env,
+            &BytesN::from_array(&env, &[0u8; 32]),
+        );
+        if admin == zero_address {
+            return Err(Error::InvalidAddress);
+        }
+        Ok(())
+    }
+
+    pub fn initialize_payment_processor(env: Env, admin: Address) -> Result<(), Error> {
+        Self::validate_init_admin(&env, admin.clone())?;
         AccessControl::initialize(&env, admin);
         
         let empty_reason = String::from_str(&env, "");
@@ -1381,6 +1419,7 @@ impl PaymentProcessor {
         
         env.storage().persistent().set(&DataKey::Paused, &initial_state);
         env.storage().persistent().set(&DataKey::CreationPaused, &initial_state);
+        Ok(())
     }
 
     pub fn set_merchant_registry_address(
@@ -2224,6 +2263,14 @@ impl PaymentProcessor {
     pub fn cancel_multiple_streams(env: Env, sender: Address, stream_ids: Vec<String>) -> Result<Vec<String>, StreamError> { PaymentStreaming::cancel_multiple_streams(env, sender, stream_ids) }
 
     pub fn batch_withdraw_to(env: Env, recipient: Address, withdrawals: Vec<WithdrawalRecipient>) -> Result<Vec<String>, StreamError> { PaymentStreaming::batch_withdraw_to(env, recipient, withdrawals) }
+
+    pub fn withdraw_all_for_recipient(env: Env, recipient: Address, max_streams: u32) -> Result<Vec<String>, StreamError> { PaymentStreaming::withdraw_all_for_recipient(env, recipient, max_streams) }
+
+    pub fn trigger_withdrawal(env: Env, stream_id: String) -> Result<String, StreamError> { PaymentStreaming::trigger_withdrawal(env, stream_id) }
+
+    pub fn set_stream_destination(env: Env, recipient: Address, stream_id: String, destination: Address) -> Result<(), StreamError> { PaymentStreaming::set_stream_destination(env, recipient, stream_id, destination) }
+
+    pub fn get_sender_streams(env: Env, sender: Address, page: u32, page_size: u32) -> Vec<PaymentStream> { PaymentStreaming::get_sender_streams(env, sender, page, page_size) }
 
     pub fn get_stream(env: Env, stream_id: String) -> Result<PaymentStream, StreamError> { PaymentStreaming::get_stream(env, stream_id) }
 
