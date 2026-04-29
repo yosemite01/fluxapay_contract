@@ -230,3 +230,72 @@ fn test_multiple_sequential_rate_decreases() {
     assert_eq!(s2.rate_per_second, 10);
     assert_eq!(s2.remaining_deposit, 3_200);
 }
+
+#[test]
+fn test_set_stream_destination_and_trigger_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+    let token_client = token::StellarAssetClient::new(&env, &token);
+
+    let stream_id = String::from_str(&env, "stream_dest");
+    let destination = Address::generate(&env);
+
+    client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id);
+    client.set_stream_destination(&receiver, &stream_id, &destination).unwrap();
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    let processed = client.trigger_withdrawal(&stream_id).unwrap();
+
+    assert_eq!(processed, stream_id);
+    assert_eq!(token_client.balance(&destination), 100i128);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.accrued_at_checkpoint, 0);
+    assert_eq!(stream.remaining_deposit, 400);
+}
+
+#[test]
+fn test_withdraw_all_for_recipient_limits_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+    let token_client = token::StellarAssetClient::new(&env, &token);
+
+    let stream_id1 = String::from_str(&env, "stream_all_1");
+    let stream_id2 = String::from_str(&env, "stream_all_2");
+    let stream_id3 = String::from_str(&env, "stream_all_3");
+
+    client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id1);
+    client.create_stream(&sender, &receiver, &token, &20i128, &500i128, &stream_id2);
+    client.create_stream(&sender, &receiver, &token, &30i128, &500i128, &stream_id3);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+
+    let processed = client.withdraw_all_for_recipient(&receiver, &2u32).unwrap();
+    assert_eq!(processed.len(), 2);
+    assert_eq!(token_client.balance(&receiver), 100 + 200);
+
+    let next = client.withdraw_all_for_recipient(&receiver, &2u32).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(token_client.balance(&receiver), 100 + 200 + 300);
+}
+
+#[test]
+fn test_get_sender_streams_pagination() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    for i in 0..5 {
+        let stream_id = String::from_str(&env, &format!("sender_page_{}", i));
+        client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id);
+    }
+
+    let page1 = client.get_sender_streams(&sender, &0u32, &2u32);
+    assert_eq!(page1.len(), 2);
+    let page2 = client.get_sender_streams(&sender, &1u32, &2u32);
+    assert_eq!(page2.len(), 2);
+    let page3 = client.get_sender_streams(&sender, &2u32, &2u32);
+    assert_eq!(page3.len(), 1);
+}
