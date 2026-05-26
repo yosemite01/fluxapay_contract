@@ -1,0 +1,48 @@
+# FluxaPay local Soroban sandbox (Issue #231)
+#
+# Usage:
+#   cp .env.docker.example .env.docker
+#   docker compose up -d
+#   source .env.docker
+#   ./scripts/sandbox-init.sh
+#
+# RPC: http://localhost:8000/soroban/rpc
+# Horizon: http://localhost:8000
+
+services:
+  stellar-quickstart:
+    image: stellar/quickstart:testing
+    container_name: fluxapay-stellar-sandbox
+    ports:
+      - "${STELLAR_SANDBOX_PORT:-8000}:8000"
+    command: >
+      --standalone
+      --enable-soroban-rpc
+      --enable-soroban-diagnostic-events
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    volumes:
+      - stellar-sandbox-data:/opt/stellar
+
+  contract-builder:
+    profiles: ["build"]
+    image: rust:1.82-bookworm
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+    environment:
+      RUST_BACKTRACE: 1
+    command: >
+      bash -lc "apt-get update && apt-get install -y pkg-config libdbus-1-dev curl &&
+      curl -fsSL https://github.com/stellar/stellar-cli/releases/latest/download/stellar-cli-x86_64-unknown-linux-gnu.tar.gz | tar -xz &&
+      mv stellar /usr/local/bin/ &&
+      cd fluxapay && stellar contract build"
+
+volumes:
+  stellar-sandbox-data:
+  cargo-cache:

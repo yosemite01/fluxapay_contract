@@ -1,0 +1,38 @@
+# FluxaPay testnet developer sandbox (Issue #231)
+#
+# Lightweight stack for SDK/CLI workflows against public Soroban testnet.
+# Does not run a local validator — points tooling at testnet RPC endpoints.
+#
+# Usage:
+#   cp .env.docker.example .env.docker
+#   docker compose -f docker-compose.testnet.yml up -d
+#   docker compose -f docker-compose.testnet.yml exec devbox bash
+
+services:
+  devbox:
+    image: node:20-bookworm
+    container_name: fluxapay-testnet-devbox
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - node-modules:/workspace/sdk/node_modules
+    env_file:
+      - .env.docker
+    environment:
+      STELLAR_NETWORK: testnet
+      STELLAR_RPC_URL: ${STELLAR_RPC_URL:-https://soroban-testnet.stellar.org}
+      STELLAR_HORIZON_URL: ${STELLAR_HORIZON_URL:-https://horizon-testnet.stellar.org}
+    command: sleep infinity
+    ports:
+      - "${DEVBOX_PORT:-8080}:8080"
+
+  sdk-check:
+    profiles: ["ci"]
+    image: node:20-bookworm
+    working_dir: /workspace/sdk
+    volumes:
+      - ./sdk:/workspace/sdk
+    command: bash -lc "npm ci && npm run build"
+
+volumes:
+  node-modules:
