@@ -16,10 +16,8 @@ services:
     volumes:
       - .:/workspace
       - node-modules:/workspace/sdk/node_modules
-    env_file:
-      - .env.docker
     environment:
-      STELLAR_NETWORK: testnet
+      STELLAR_NETWORK: ${STELLAR_NETWORK:-testnet}
       STELLAR_RPC_URL: ${STELLAR_RPC_URL:-https://soroban-testnet.stellar.org}
       STELLAR_HORIZON_URL: ${STELLAR_HORIZON_URL:-https://horizon-testnet.stellar.org}
     command: sleep infinity
