@@ -70,6 +70,7 @@ fn create_payment_args(
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
     }
 }
 
@@ -1882,6 +1883,7 @@ fn test_create_payment_idempotency_retry_returns_same_payment() {
         memo_type: None,
         token_address: None,
         client_token: client_token.clone(),
+        metadata_hash: None,
     };
 
     let first = client.create_payment(&args);
@@ -1917,6 +1919,7 @@ fn test_create_payment_idempotency_different_payment_id_fails() {
         memo_type: None,
         token_address: None,
         client_token: client_token.clone(),
+        metadata_hash: None,
     };
 
     // First call succeeds
@@ -1955,6 +1958,7 @@ fn test_create_payment_without_idempotency_token_fails_on_retry() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
     };
 
     client.create_payment(&args);

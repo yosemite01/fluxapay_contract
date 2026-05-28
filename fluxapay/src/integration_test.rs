@@ -78,6 +78,7 @@ fn test_happy_path_flow() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
     };
     payment_client.create_payment(&args);
 
@@ -147,6 +148,7 @@ fn test_settlement_path() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
     };
     payment_client.create_payment(&args);
 
@@ -199,6 +201,7 @@ fn test_failure_and_expiration_path() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
     };
     payment_client.create_payment(&args);
 

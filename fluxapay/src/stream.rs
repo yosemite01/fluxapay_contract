@@ -95,6 +95,29 @@ pub enum StreamError {
     ContractPaused = 9,
     /// Stream distributions are locked until the sender approves milestones.
     MilestoneNotApproved = 10,
+    /// Withdrawal already in progress (reentrancy guard).
+    WithdrawalInProgress = 11,
+}
+
+/// Storage key for the per-stream withdrawal reentrancy lock.
+#[contracttype]
+enum WithdrawLockKey {
+    Lock(String),
+}
+
+fn acquire_lock(env: &Env, stream_id: &String) -> Result<(), StreamError> {
+    let key = WithdrawLockKey::Lock(stream_id.clone());
+    if env.storage().temporary().has(&key) {
+        return Err(StreamError::WithdrawalInProgress);
+    }
+    env.storage().temporary().set(&key, &true);
+    Ok(())
+}
+
+fn release_lock(env: &Env, stream_id: &String) {
+    env.storage()
+        .temporary()
+        .remove(&WithdrawLockKey::Lock(stream_id.clone()));
 }
 
 fn require_not_paused(env: &Env) -> Result<(), StreamError> {
@@ -248,6 +271,9 @@ impl PaymentStreaming {
     ///
     /// This lets anyone trigger a withdrawal later, while the recipient
     /// retains control of where funds are routed.
+    ///
+    /// Auth: only the stream's `receiver` may call this (recipient.require_auth()
+    /// + ownership check). Rejects if the stream is not Active.
     pub fn set_stream_destination(
         env: Env,
         recipient: Address,
@@ -262,6 +288,7 @@ impl PaymentStreaming {
             .get(&StreamDataKey::Stream(stream_id.clone()))
             .ok_or(StreamError::StreamNotFound)?;
 
+        // Auth check: caller must be the stream's receiver
         if stream.receiver != recipient {
             return Err(StreamError::Unauthorized);
         }
@@ -569,8 +596,11 @@ impl PaymentStreaming {
                     .persistent()
                     .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
 
+                // Reentrancy guard: lock acquired after state is persisted
+                acquire_lock(&env, &stream_id)?;
                 let token_client = token::Client::new(&env, &stream.token);
                 token_client.transfer(&env.current_contract_address(), &recipient, &withdrawable);
+                release_lock(&env, &stream_id);
 
                 env.events().publish(
                     (
@@ -607,7 +637,6 @@ impl PaymentStreaming {
         }
 
         if !stream.milestones_approved {
-            // Distributions are locked until sender approves milestones.
             return Err(StreamError::MilestoneNotApproved);
         }
 
@@ -615,6 +644,9 @@ impl PaymentStreaming {
             .destination
             .clone()
             .ok_or(StreamError::DestinationNotSet)?;
+
+        // Reentrancy guard: acquire lock before any state mutation or transfer
+        acquire_lock(&env, &stream_id)?;
 
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(stream.last_checkpoint_at);
@@ -648,6 +680,8 @@ impl PaymentStreaming {
 
         let token_client = token::Client::new(&env, &stream.token);
         token_client.transfer(&env.current_contract_address(), &destination, &withdrawable);
+
+        release_lock(&env, &stream_id);
 
         env.events().publish(
             (
@@ -837,6 +871,77 @@ impl PaymentStreaming {
                 .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
 
             // Interactions
+            let token_client = token::Client::new(&env, &stream.token);
+            if accrued > 0 {
+                token_client.transfer(&env.current_contract_address(), &stream.receiver, &accrued);
+            }
+            if refund > 0 {
+                token_client.transfer(&env.current_contract_address(), &stream.sender, &refund);
+            }
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "STREAM"),
+                    Symbol::new(&env, "CANCELLED"),
+                    stream_id.clone(),
+                ),
+                (sender.clone(), accrued, refund),
+            );
+
+            cancelled.push_back(stream_id);
+        }
+
+        Ok(cancelled)
+    }
+
+    /// Cancel up to `MAX_BATCH_CANCEL` streams in a single transaction, skipping
+    /// streams that are not active or not owned by `sender` instead of aborting.
+    /// Returns the list of successfully cancelled stream IDs.
+    pub fn batch_cancel_streams(
+        env: Env,
+        sender: Address,
+        stream_ids: Vec<String>,
+    ) -> Result<Vec<String>, StreamError> {
+        const MAX_BATCH_CANCEL: u32 = 20;
+        sender.require_auth();
+
+        let mut cancelled = Vec::new(&env);
+        let now = env.ledger().timestamp();
+
+        for (i, stream_id) in stream_ids.iter().enumerate() {
+            if i as u32 >= MAX_BATCH_CANCEL {
+                break;
+            }
+            let mut stream: PaymentStream = match env
+                .storage()
+                .persistent()
+                .get(&StreamDataKey::Stream(stream_id.clone()))
+            {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if stream.sender != sender || stream.status != StreamStatus::Active {
+                continue;
+            }
+
+            let elapsed = now.saturating_sub(stream.last_checkpoint_at);
+            let newly_accrued = (elapsed as i128)
+                .saturating_mul(stream.rate_per_second)
+                .min(stream.remaining_deposit - stream.accrued_at_checkpoint);
+            stream.accrued_at_checkpoint =
+                stream.accrued_at_checkpoint.saturating_add(newly_accrued);
+            stream.last_checkpoint_at = now;
+
+            let accrued = stream.accrued_at_checkpoint;
+            let refund = stream.remaining_deposit.saturating_sub(accrued);
+
+            stream.status = StreamStatus::Cancelled;
+            stream.remaining_deposit = accrued;
+            env.storage()
+                .persistent()
+                .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
             let token_client = token::Client::new(&env, &stream.token);
             if accrued > 0 {
                 token_client.transfer(&env.current_contract_address(), &stream.receiver, &accrued);
