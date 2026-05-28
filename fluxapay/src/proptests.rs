@@ -93,6 +93,7 @@ proptest! {
             memo_type: None,
             token_address: None,
             client_token: None,
+            metadata_hash: None,
         };
 
         client.create_payment(&args);
@@ -142,6 +143,7 @@ proptest! {
             memo_type: None,
             token_address: None,
             client_token: None,
+            metadata_hash: None,
         };
 
         client.create_payment(&args);
