@@ -14,6 +14,11 @@ const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
 pub const DEFAULT_PAYMENT_DURATION_SECS: u64 = 3_600;
 const REFUND_FEE_BPS: i128 = 100;
 
+// Issue #167: Tiered refund fees based on merchant KYC tier
+const REFUND_FEE_BPS_BASIC: i128 = 100;     // 1.0% for Basic tier
+const REFUND_FEE_BPS_FULL: i128 = 80;       // 0.8% for Full tier
+const REFUND_FEE_BPS_BUSINESS: i128 = 50;   // 0.5% for Business tier
+
 /// Maximum number of payment retries before a subscription is cancelled.
 pub const SUBSCRIPTION_MAX_RETRIES: u32 = 3;
 /// Spacing between retry attempts in seconds (2 days).
@@ -637,7 +642,37 @@ impl RefundManager {
             .ok_or(Error::Unauthorized)?;
         let token_client = token::TokenClient::new(env, &usdc_token_address);
 
-        let fee = refund.amount * REFUND_FEE_BPS / 10_000;
+        // Issue #167: Query merchant's KYC tier and apply tiered refund fee
+        let payment: PaymentCharge = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PaymentCharge>(&DataKey::Payment(refund.payment_id.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+
+        let fee_bps = if let Some(registry_address) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+        {
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(env, &registry_address);
+            match registry_client.try_get_merchant(&payment.merchant_id) {
+                Ok(Ok(merchant)) => {
+                    use crate::merchant_registry::KycTier;
+                    match merchant.kyc_tier {
+                        KycTier::Business => REFUND_FEE_BPS_BUSINESS,
+                        KycTier::Full => REFUND_FEE_BPS_FULL,
+                        KycTier::Basic => REFUND_FEE_BPS_BASIC,
+                        KycTier::Unverified => REFUND_FEE_BPS, // Default 1%
+                    }
+                }
+                _ => REFUND_FEE_BPS, // Default if registry lookup fails
+            }
+        } else {
+            REFUND_FEE_BPS // Default if no registry configured
+        };
+
+        let fee = refund.amount * fee_bps / 10_000;
         let net_amount = refund.amount - fee;
 
         let from = env.current_contract_address();
@@ -2186,7 +2221,7 @@ impl PaymentProcessor {
             return Err(Error::Unauthorized);
         }
 
-        // Validate token: if provided it must be on the allowlist; if absent the default USDC token is used.
+        // Issue #164: Validate token against admin-approved allowlist
         if let Some(ref token_addr) = args.token_address {
             let allowed: bool = env
                 .storage()
@@ -2283,13 +2318,15 @@ impl PaymentProcessor {
             .set(&merchant_payments_key, &merchant_payments);
         Self::bump_ttl(&env, &merchant_payments_key, LONG_LIVE_TTL);
 
+        // Issue #166: Optimize event topics for high-volume ingestions
+        // Use standardized (Symbol, Symbol, Address) format for efficient wildcard filtering
         env.events().publish(
             (
                 Symbol::new(&env, "PAYMENT"),
                 Symbol::new(&env, "CREATED"),
-                args.payment_id.clone(),
+                args.merchant_id.clone(),
             ),
-            (args.merchant_id, args.amount),
+            (args.payment_id.clone(), args.amount),
         );
 
         // Persist idempotency key → payment_id mapping so retries are safe.
@@ -2300,6 +2337,172 @@ impl PaymentProcessor {
         }
 
         Ok(payment)
+    }
+
+    /// Issue #165: Batch payment creation for optimized gas usage.
+    /// Creates multiple payment charges in a single transaction.
+    /// Reverts all if any element violates validation rules.
+    #[allow(deprecated)]
+    pub fn create_payments_batch(
+        env: Env,
+        args_list: Vec<CreatePaymentArgs>,
+    ) -> Result<Vec<String>, Error> {
+        Self::require_creation_not_paused(&env)?;
+
+        if args_list.is_empty() {
+            return Ok(vec![&env]);
+        }
+
+        // Validate all payments first before creating any
+        for args in args_list.iter() {
+            args.merchant_id.require_auth();
+
+            // Verify merchant role
+            if !AccessControl::has_role(&env, &role_merchant(&env), &args.merchant_id) {
+                return Err(Error::Unauthorized);
+            }
+
+            // Issue #164: Validate token against allowlist
+            if let Some(ref token_addr) = args.token_address {
+                let allowed: bool = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, bool>(&DataKey::AllowedToken(token_addr.clone()))
+                    .unwrap_or(false);
+                if !allowed {
+                    return Err(Error::UnsupportedToken);
+                }
+            }
+
+            // Validate merchant is verified and active
+            if let Some(registry_address) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+            {
+                let registry_client =
+                    crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+                match registry_client.try_get_merchant(&args.merchant_id) {
+                    Ok(Ok(merchant)) => {
+                        if merchant.kyc_tier == crate::merchant_registry::KycTier::Unverified
+                            || !merchant.active
+                            || merchant.suspension_reason.is_some()
+                        {
+                            return Err(Error::Unauthorized);
+                        }
+                    }
+                    _ => {
+                        return Err(Error::Unauthorized);
+                    }
+                }
+            }
+
+            if args.amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            Self::enforce_amount_limits(&env, &args.merchant_id, args.amount)?;
+
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::Payment(args.payment_id.clone()))
+            {
+                return Err(Error::PaymentAlreadyExists);
+            }
+
+            if args.payment_id.is_empty() {
+                return Err(Error::InvalidPaymentId);
+            }
+
+            // Check idempotency
+            if let Some(ref token) = args.client_token {
+                let key = DataKey::IdempotencyKey(token.clone());
+                if let Some(existing_id) = env.storage().persistent().get::<DataKey, String>(&key) {
+                    if existing_id != args.payment_id {
+                        return Err(Error::DuplicateIdempotencyKey);
+                    }
+                }
+            }
+        }
+
+        // All validations passed, now create all payments
+        let mut payment_ids = vec![&env];
+        let now = env.ledger().timestamp();
+
+        for args in args_list.iter() {
+            // Rate limit check per merchant
+            Self::enforce_create_payment_rate_limit(&env, &args.merchant_id)?;
+
+            let resolved_expires_at = match args.expires_at {
+                Some(ts) => ts,
+                None => now.saturating_add(args.duration_secs.unwrap_or(DEFAULT_PAYMENT_DURATION_SECS)),
+            };
+            if resolved_expires_at <= now {
+                return Err(Error::InvalidExpiry);
+            }
+
+            let payment = PaymentCharge {
+                payment_id: args.payment_id.clone(),
+                merchant_id: args.merchant_id.clone(),
+                amount: args.amount,
+                currency: args.currency.clone(),
+                deposit_address: args.deposit_address.clone(),
+                status: PaymentStatus::Pending,
+                payer_address: None,
+                transaction_hash: None,
+                created_at: now,
+                confirmed_at: None,
+                expires_at: resolved_expires_at,
+                amount_received: None,
+                memo: args.memo.clone(),
+                memo_type: args.memo_type.clone(),
+                token_address: args.token_address.clone(),
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(args.payment_id.clone()), &payment);
+            Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
+
+            let mut merchant_payments = Self::get_merchant_payments_internal(&env, &args.merchant_id);
+            merchant_payments.push_back(args.payment_id.clone());
+            let merchant_payments_key = DataKey::MerchantPayments(args.merchant_id.clone());
+            env.storage()
+                .persistent()
+                .set(&merchant_payments_key, &merchant_payments);
+            Self::bump_ttl(&env, &merchant_payments_key, LONG_LIVE_TTL);
+
+            // Issue #166: Optimize event topics
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT"),
+                    Symbol::new(&env, "CREATED"),
+                    args.merchant_id.clone(),
+                ),
+                (args.payment_id.clone(), args.amount),
+            );
+
+            // Persist idempotency key
+            if let Some(ref token) = args.client_token {
+                let key = DataKey::IdempotencyKey(token.clone());
+                env.storage().persistent().set(&key, &args.payment_id);
+                Self::bump_ttl(&env, &key, LONG_LIVE_TTL);
+            }
+
+            payment_ids.push_back(args.payment_id.clone());
+        }
+
+        // Emit batch creation event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "BATCH_CREATED"),
+            ),
+            payment_ids.len(),
+        );
+
+        Ok(payment_ids)
     }
 
     #[allow(deprecated)]
@@ -2393,9 +2596,10 @@ impl PaymentProcessor {
             _ => Symbol::new(&env, "FAILED"),
         };
 
+        // Issue #166: Optimize event topics for efficient indexing
         env.events().publish(
-            (Symbol::new(&env, "PAYMENT"), event_name, payment_id.clone()),
-            (payment.merchant_id, payment.amount, amount_received),
+            (Symbol::new(&env, "PAYMENT"), event_name, payment.merchant_id.clone()),
+            (payment_id.clone(), payment.amount, amount_received),
         );
 
         Ok(new_status)
@@ -2454,13 +2658,14 @@ impl PaymentProcessor {
                 .set(&DataKey::Payment(payment_id.clone()), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
+            // Issue #166: Optimize event topics
             env.events().publish(
                 (
                     Symbol::new(&env, "PAYMENT"),
                     Symbol::new(&env, "EXPIRED"),
-                    payment_id.clone(),
+                    payment.merchant_id.clone(),
                 ),
-                (payment.merchant_id, payment.amount),
+                (payment_id.clone(), payment.amount),
             );
 
             return Ok(());
@@ -2480,13 +2685,14 @@ impl PaymentProcessor {
             .set(&DataKey::Payment(payment_id.clone()), &payment);
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
+        // Issue #166: Optimize event topics
         env.events().publish(
             (
                 Symbol::new(&env, "PAYMENT"),
                 Symbol::new(&env, "CANCELLED"),
-                payment_id.clone(),
+                payment.merchant_id.clone(),
             ),
-            (payment.merchant_id, payment.amount),
+            (payment_id.clone(), payment.amount),
         );
 
         Ok(())
@@ -2511,13 +2717,14 @@ impl PaymentProcessor {
             .set(&DataKey::Payment(payment_id.clone()), &payment);
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
+        // Issue #166: Optimize event topics
         env.events().publish(
             (
                 Symbol::new(&env, "PAYMENT"),
                 Symbol::new(&env, "EXPIRED"),
-                payment_id.clone(),
+                payment.merchant_id.clone(),
             ),
-            (payment.merchant_id, payment.amount),
+            (payment_id.clone(), payment.amount),
         );
 
         Ok(())
@@ -2564,13 +2771,14 @@ impl PaymentProcessor {
             .set(&DataKey::Payment(payment_id.clone()), &payment);
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
+        // Issue #166: Optimize event topics
         env.events().publish(
             (
                 Symbol::new(&env, "PAYMENT"),
                 Symbol::new(&env, "SETTLED"),
-                payment_id.clone(),
+                payment.merchant_id.clone(),
             ),
-            (payment.merchant_id, payment.amount),
+            (payment_id.clone(), payment.amount),
         );
 
         Ok(())
