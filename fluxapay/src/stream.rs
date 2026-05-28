@@ -50,6 +50,9 @@ pub struct PaymentStream {
     pub accrued_at_checkpoint: i128,
     /// Stream lifecycle state.
     pub status: StreamStatus,
+    /// When false, distributions (withdrawals) are locked until the sender
+    /// explicitly approves milestones for this stream.
+    pub milestones_approved: bool,
 }
 
 /// Storage key for a [`PaymentStream`].
@@ -90,6 +93,8 @@ pub enum StreamError {
     DestinationNotSet = 8,
     /// The contract is currently globally paused.
     ContractPaused = 9,
+    /// Stream distributions are locked until the sender approves milestones.
+    MilestoneNotApproved = 10,
 }
 
 fn require_not_paused(env: &Env) -> Result<(), StreamError> {
@@ -213,6 +218,7 @@ impl PaymentStreaming {
             last_checkpoint_at: now,
             accrued_at_checkpoint: 0,
             status: StreamStatus::Active,
+            milestones_approved: false,
         };
 
         // Persist state before interaction (reentrancy protection)
@@ -276,6 +282,41 @@ impl PaymentStreaming {
                 stream_id,
             ),
             (recipient, destination),
+        );
+
+        Ok(())
+    }
+
+    /// Sender approves milestones for a stream, unlocking distributions.
+    pub fn approve_stream_milestone(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+
+        stream.milestones_approved = true;
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "STREAM"),
+                Symbol::new(&env, "MILESTONE_APPROVED"),
+                stream_id,
+            ),
+            (sender,),
         );
 
         Ok(())
@@ -495,6 +536,11 @@ impl PaymentStreaming {
                     continue;
                 }
 
+                // Skip streams that are locked by unapproved milestones.
+                if !stream.milestones_approved {
+                    continue;
+                }
+
                 let now = env.ledger().timestamp();
                 let elapsed = now.saturating_sub(stream.last_checkpoint_at);
                 let newly_accrued = (elapsed as i128)
@@ -558,6 +604,11 @@ impl PaymentStreaming {
 
         if stream.status != StreamStatus::Active {
             return Err(StreamError::StreamNotActive);
+        }
+
+        if !stream.milestones_approved {
+            // Distributions are locked until sender approves milestones.
+            return Err(StreamError::MilestoneNotApproved);
         }
 
         let destination = stream
@@ -840,6 +891,11 @@ impl PaymentStreaming {
             }
             if stream.status != StreamStatus::Active {
                 return Err(StreamError::StreamNotActive);
+            }
+
+            // Disallow withdrawals until sender has approved milestones.
+            if !stream.milestones_approved {
+                return Err(StreamError::MilestoneNotApproved);
             }
 
             // Recompute accrued up to now

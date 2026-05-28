@@ -318,6 +318,11 @@ pub struct Subscription {
     /// When set, the subscription will automatically resume at this timestamp.
     /// Only meaningful when `status == Paused`.
     pub resume_at: Option<u64>,
+    /// Optional affiliate address to receive a percentage of each payment.
+    pub affiliate: Option<Address>,
+    /// Affiliate fee in basis points (bps). If set and `affiliate` is Some,
+    /// `affiliate_fee_bps / 10000` of each payment will be routed to the affiliate.
+    pub affiliate_fee_bps: Option<u32>,
 }
 
 #[contracttype]
@@ -331,6 +336,10 @@ pub struct SubscriptionPlan {
     pub currency: Symbol,
     pub interval_secs: u64,
     pub active: bool,
+    /// Optional split payout configuration for bundle subscriptions.
+    /// If non-empty, the plan amount will be distributed to the configured
+    /// `SettlementSplit` recipients on each subscription charge.
+    pub payout_splits: Vec<SettlementSplit>,
 }
 
 #[contracttype]
@@ -1236,6 +1245,7 @@ impl RefundManager {
             currency,
             interval_secs,
             active: true,
+            payout_splits: Vec::new(&env),
         };
 
         env.storage()
@@ -1282,6 +1292,8 @@ impl RefundManager {
         payer: Address,
         plan_id: String,
         max_payments: Option<u32>,
+        affiliate: Option<Address>,
+        affiliate_fee_bps: Option<u32>,
     ) -> Result<String, Error> {
         payer.require_auth();
 
@@ -1316,6 +1328,8 @@ impl RefundManager {
             retry_count: 0,
             next_retry_at: None,
             resume_at: None,
+            affiliate: affiliate.clone(),
+            affiliate_fee_bps,
         };
 
         env.storage().persistent().set(
@@ -1514,12 +1528,58 @@ impl RefundManager {
         let merchant = subscription.merchant_id.clone();
         let amount = subscription.amount;
 
+        // Pull the full amount into this contract so we can distribute splits/fees.
         let transfer_ok = token_client
-            .try_transfer(&payer, &merchant, &amount)
+            .try_transfer(&payer, &env.current_contract_address(), &amount)
             .is_ok();
 
         if transfer_ok {
             // ── Success path ──────────────────────────────────────────────────
+            // Distribute according to plan splits or affiliate settings.
+            // First try to resolve the plan and its payout splits.
+            if let Ok(plan) = Self::get_subscription_plan(env.clone(), subscription.plan_id.clone()) {
+                if plan.payout_splits.len() > 0 {
+                    // If payout_splits configured, send each recipient their configured amount.
+                    for s in plan.payout_splits.iter() {
+                        let _ = token_client.try_transfer(
+                            &env.current_contract_address(),
+                            &s.recipient,
+                            &s.amount,
+                        );
+                    }
+                } else if let (Some(aff), Some(bps)) = (subscription.affiliate.clone(), subscription.affiliate_fee_bps) {
+                    // Pay affiliate fee then merchant receives remainder.
+                    let fee = amount.saturating_mul(bps as i128) / 10_000i128;
+                    let merchant_amount = amount.saturating_sub(fee);
+                    if fee > 0 {
+                        let _ = token_client.try_transfer(
+                            &env.current_contract_address(),
+                            &aff,
+                            &fee,
+                        );
+                    }
+                    let _ = token_client.try_transfer(
+                        &env.current_contract_address(),
+                        &merchant,
+                        &merchant_amount,
+                    );
+                } else {
+                    // Default: send full amount to merchant.
+                    let _ = token_client.try_transfer(
+                        &env.current_contract_address(),
+                        &merchant,
+                        &amount,
+                    );
+                }
+            } else {
+                // If plan can't be loaded, fall back to sending full amount to merchant.
+                let _ = token_client.try_transfer(
+                    &env.current_contract_address(),
+                    &merchant,
+                    &amount,
+                );
+            }
+
             subscription.last_payment_at = Some(now);
             subscription.total_payments = subscription.total_payments.saturating_add(1);
             subscription.retry_count = 0;
@@ -1544,13 +1604,18 @@ impl RefundManager {
                     Symbol::new(&env, "CHARGED"),
                 ),
                 (
-                    subscription_id,
-                    payer,
-                    merchant,
+                    subscription_id.clone(),
+                    payer.clone(),
+                    merchant.clone(),
                     amount,
                     subscription.total_payments,
                 ),
             );
+
+            // Emit explicit expired event when the subscription reached its cap.
+            if subscription.status == SubscriptionStatus::Expired {
+                env.events().publish((Symbol::new(&env, "SUBSCRIPTION_EXPIRED"),), (subscription_id, payer));
+            }
         } else {
             // ── Failure path — grace period / retry logic ─────────────────────
             subscription.retry_count = subscription.retry_count.saturating_add(1);
@@ -1576,6 +1641,9 @@ impl RefundManager {
                         subscription.retry_count,
                     ),
                 );
+
+                // Also emit a single-topic cancellation event for indexers.
+                env.events().publish((Symbol::new(&env, "SUBSCRIPTION_CANCELLED"),), (subscription_id, payer));
 
                 return Err(Error::SubscriptionRetryExhausted);
             } else {
@@ -1654,6 +1722,9 @@ impl RefundManager {
         env.storage()
             .persistent()
             .set(&DataKey::Subscription(subscription_id), &subscription);
+
+        // Emit cancellation event for consumers and indexers
+        env.events().publish((Symbol::new(&env, "SUBSCRIPTION_CANCELLED"),), (payer,));
 
         Ok(())
     }
