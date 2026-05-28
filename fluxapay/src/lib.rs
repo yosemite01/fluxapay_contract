@@ -253,6 +253,28 @@ pub struct SettlementSplit {
     pub amount: i128,
 }
 
+/// Vote choice for stake-weighted dispute voting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VoteChoice {
+    /// Vote in favour of the disputer (refund should be issued).
+    Favour,
+    /// Vote against the disputer (dispute should be rejected).
+    Against,
+}
+
+/// Accumulated vote tally for a dispute.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteTally {
+    /// Total stake weight voting in favour.
+    pub favour_weight: i128,
+    /// Total stake weight voting against.
+    pub against_weight: i128,
+    /// Number of arbitrators who have voted.
+    pub vote_count: u32,
+}
+
 /// Operator note persisted on-chain for dispute transparency.
 ///
 /// Stored under `DataKey::DisputeOperatorNote(dispute_id)` and emitted
@@ -402,6 +424,12 @@ pub enum DataKey {
     StreamCounter,
     /// Stores operator notes keyed by dispute_id for on-chain transparency.
     DisputeOperatorNote(String),
+    /// Locked stake for a dispute arbitrator: (dispute_id, arbitrator) → amount
+    DisputeStake(String, Address),
+    /// Vote cast by an arbitrator: (dispute_id, arbitrator) → VoteChoice
+    DisputeVote(String, Address),
+    /// Tally of votes for a dispute
+    DisputeVoteTally(String),
 }
 
 // When building for WASM deployment, only the active contract's #[contractimpl]
@@ -736,6 +764,98 @@ impl RefundManager {
 
     /// Cancel a pending refund. Caller must be the refund requester (merchant) or contract admin.
     /// Removes the refund from the payment's pending list and emits REFUND/CANCELLED.
+    /// Instantly refund a payment without operator approval.
+    ///
+    /// Only merchants with KYC tier `Full` or `Business` may call this.
+    /// The merchant must be the `merchant_id` on the original payment.
+    /// Executes the USDC transfer immediately (no `Pending` state).
+    pub fn refund_instantly(
+        env: Env,
+        merchant_id: Address,
+        payment_id: String,
+        refund_amount: i128,
+        reason: String,
+        registry_address: Address,
+    ) -> Result<String, Error> {
+        merchant_id.require_auth();
+
+        // Verify merchant KYC tier is Full or Business via cross-contract call
+        let registry_client =
+            crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+        let merchant = registry_client
+            .try_get_merchant(&merchant_id)
+            .map_err(|_| Error::Unauthorized)?
+            .map_err(|_| Error::Unauthorized)?;
+
+        let is_high_trust = merchant.kyc_tier == crate::merchant_registry::KycTier::Full
+            || merchant.kyc_tier == crate::merchant_registry::KycTier::Business;
+        if !is_high_trust {
+            return Err(Error::Unauthorized);
+        }
+
+        // Validate payment belongs to this merchant and is Confirmed
+        let payment: PaymentCharge = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if payment.merchant_id != merchant_id {
+            return Err(Error::Unauthorized);
+        }
+        if payment.status != PaymentStatus::Confirmed {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        // Create the refund record (validates amount, checks totals)
+        let refund_id = Self::create_refund_internal(
+            &env,
+            payment_id,
+            refund_amount,
+            reason,
+            payment.payer_address.clone().ok_or(Error::Unauthorized)?,
+        )?;
+
+        // Execute transfer immediately — no operator approval needed
+        let usdc_token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcToken)
+            .ok_or(Error::Unauthorized)?;
+        let token_client = token::TokenClient::new(&env, &usdc_token_address);
+
+        let fee = refund_amount * REFUND_FEE_BPS / 10_000;
+        let net_amount = refund_amount - fee;
+
+        let mut refund = Self::get_refund_internal(&env, &refund_id)?;
+        refund.status = RefundStatus::Completed;
+        refund.processed_at = Some(env.ledger().timestamp());
+
+        // Effects before interaction (CEI)
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id.clone()), &refund);
+        Self::bump_refund_ttl(&env, &refund_id, &refund.status);
+
+        let from = env.current_contract_address();
+        let to: MuxedAddress = (&refund.requester).into();
+        let _ = token_client.try_transfer(&from, &to, &net_amount);
+
+        if fee > 0 {
+            if let Some(admin) = AccessControl::get_admin(&env) {
+                let admin_muxed: MuxedAddress = (&admin).into();
+                let _ = token_client.try_transfer(&from, &admin_muxed, &fee);
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "REFUND"), Symbol::new(&env, "COMPLETED")),
+            (refund.payment_id, refund_id.clone(), refund_amount),
+        );
+
+        Ok(refund_id)
+    }
+
     pub fn cancel_refund(env: Env, caller: Address, refund_id: String) -> Result<(), Error> {
         caller.require_auth();
 
@@ -1189,6 +1309,282 @@ impl RefundManager {
             .persistent()
             .get(&DataKey::DisputeOperatorNote(dispute_id))
             .ok_or(Error::DisputeNotFound)
+    }
+
+    // ─── Stake-weighted dispute voting (issue #33) ────────────────────────────
+
+    /// Lock a governance-token stake to participate in dispute voting.
+    ///
+    /// The arbitrator transfers `amount` tokens into the contract as a stake.
+    /// The stake is slashed if the arbitrator votes against the majority.
+    ///
+    /// # Parameters
+    /// * `arbitrator`  – Address locking the stake; must sign.
+    /// * `dispute_id`  – Dispute to vote on.
+    /// * `token`       – Governance token contract address.
+    /// * `amount`      – Amount to lock (must be > 0).
+    pub fn lock_stake(
+        env: Env,
+        arbitrator: Address,
+        dispute_id: String,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        arbitrator.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Dispute must exist and be open / under review
+        let dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        // Prevent double-staking
+        let stake_key = DataKey::DisputeStake(dispute_id.clone(), arbitrator.clone());
+        if env.storage().persistent().has(&stake_key) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Effects: record stake before token transfer
+        env.storage().persistent().set(&stake_key, &amount);
+        Self::bump_ttl(&env, &stake_key, LONG_LIVE_TTL);
+
+        // Interaction: pull stake from arbitrator
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&arbitrator, &env.current_contract_address(), &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "STAKE_LOCKED")),
+            (dispute_id, arbitrator, amount),
+        );
+
+        Ok(())
+    }
+
+    /// Cast a stake-weighted vote on a dispute.
+    ///
+    /// The arbitrator must have locked a stake first via `lock_stake`.
+    /// Each arbitrator may only vote once per dispute.
+    ///
+    /// # Parameters
+    /// * `arbitrator` – Voting arbitrator; must sign.
+    /// * `dispute_id` – Dispute to vote on.
+    /// * `choice`     – `VoteChoice::Favour` or `VoteChoice::Against`.
+    pub fn cast_vote(
+        env: Env,
+        arbitrator: Address,
+        dispute_id: String,
+        choice: VoteChoice,
+    ) -> Result<(), Error> {
+        arbitrator.require_auth();
+
+        // Dispute must be open / under review
+        let dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        // Arbitrator must have a locked stake
+        let stake_key = DataKey::DisputeStake(dispute_id.clone(), arbitrator.clone());
+        let stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&stake_key)
+            .ok_or(Error::Unauthorized)?;
+
+        // Prevent double-voting
+        let vote_key = DataKey::DisputeVote(dispute_id.clone(), arbitrator.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Record vote
+        env.storage().persistent().set(&vote_key, &choice);
+        Self::bump_ttl(&env, &vote_key, LONG_LIVE_TTL);
+
+        // Update tally
+        let tally_key = DataKey::DisputeVoteTally(dispute_id.clone());
+        let mut tally: VoteTally = env
+            .storage()
+            .persistent()
+            .get(&tally_key)
+            .unwrap_or(VoteTally {
+                favour_weight: 0,
+                against_weight: 0,
+                vote_count: 0,
+            });
+
+        match choice {
+            VoteChoice::Favour => tally.favour_weight = tally.favour_weight.saturating_add(stake),
+            VoteChoice::Against => {
+                tally.against_weight = tally.against_weight.saturating_add(stake)
+            }
+        }
+        tally.vote_count = tally.vote_count.saturating_add(1);
+
+        env.storage().persistent().set(&tally_key, &tally);
+        Self::bump_ttl(&env, &tally_key, LONG_LIVE_TTL);
+
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "VOTE_CAST")),
+            (dispute_id, arbitrator, stake),
+        );
+
+        Ok(())
+    }
+
+    /// Finalize a dispute based on stake-weighted votes.
+    ///
+    /// The majority side wins. Arbitrators who voted against the majority
+    /// lose 10% of their stake (slashed to the contract admin). Winners
+    /// receive their stake back.
+    ///
+    /// # Parameters
+    /// * `operator`    – Settlement operator or oracle; must sign.
+    /// * `dispute_id`  – Dispute to finalize.
+    /// * `token`       – Governance token used for stakes.
+    /// * `arbitrators` – List of all arbitrators who participated.
+    pub fn finalize_dispute_vote(
+        env: Env,
+        operator: Address,
+        dispute_id: String,
+        token: Address,
+        arbitrators: Vec<Address>,
+    ) -> Result<(), Error> {
+        operator.require_auth();
+
+        let has_settlement =
+            AccessControl::has_role(&env, &role_settlement_operator(&env), &operator);
+        let has_oracle = AccessControl::has_role(&env, &role_oracle(&env), &operator);
+        if !has_settlement && !has_oracle {
+            return Err(Error::Unauthorized);
+        }
+
+        let dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        let tally_key = DataKey::DisputeVoteTally(dispute_id.clone());
+        let tally: VoteTally = env
+            .storage()
+            .persistent()
+            .get(&tally_key)
+            .unwrap_or(VoteTally {
+                favour_weight: 0,
+                against_weight: 0,
+                vote_count: 0,
+            });
+
+        // Determine majority
+        let favour_wins = tally.favour_weight >= tally.against_weight;
+        let majority = if favour_wins {
+            VoteChoice::Favour
+        } else {
+            VoteChoice::Against
+        };
+
+        let token_client = token::Client::new(&env, &token);
+        let slash_bps: i128 = 1_000; // 10% slash
+
+        // Return stakes; slash minority voters
+        for arb in arbitrators.iter() {
+            let stake_key = DataKey::DisputeStake(dispute_id.clone(), arb.clone());
+            let stake: i128 = match env.storage().persistent().get(&stake_key) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let vote_key = DataKey::DisputeVote(dispute_id.clone(), arb.clone());
+            let vote: VoteChoice = match env.storage().persistent().get(&vote_key) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let voted_with_majority = vote == majority;
+
+            // Effects: remove stake record
+            env.storage().persistent().remove(&stake_key);
+
+            if voted_with_majority {
+                // Return full stake
+                token_client.transfer(&env.current_contract_address(), &arb, &stake);
+            } else {
+                // Slash 10%, return remainder
+                let slash = stake * slash_bps / 10_000;
+                let remainder = stake.saturating_sub(slash);
+                if remainder > 0 {
+                    token_client.transfer(&env.current_contract_address(), &arb, &remainder);
+                }
+                if slash > 0 {
+                    if let Some(admin) = AccessControl::get_admin(&env) {
+                        token_client.transfer(&env.current_contract_address(), &admin, &slash);
+                    }
+                }
+            }
+        }
+
+        // Resolve or reject the dispute based on vote outcome
+        if favour_wins {
+            // Majority voted in favour — issue refund
+            let refund_reason =
+                String::from_str(&env, "Resolved by stake-weighted arbitration vote");
+            if let Ok(refund_id) = Self::create_refund_internal(
+                &env,
+                dispute.payment_id.clone(),
+                dispute.amount,
+                refund_reason,
+                dispute.disputer.clone(),
+            ) {
+                let _ = Self::process_refund_internal(&env, &operator, refund_id);
+            }
+
+            let mut d = Self::get_dispute_internal(&env, &dispute_id)?;
+            d.status = DisputeStatus::Resolved;
+            d.resolved_at = Some(env.ledger().timestamp());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id.clone()), &d);
+            Self::bump_dispute_ttl(&env, &dispute_id, &d.status);
+        } else {
+            let mut d = Self::get_dispute_internal(&env, &dispute_id)?;
+            d.status = DisputeStatus::Rejected;
+            d.resolved_at = Some(env.ledger().timestamp());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id.clone()), &d);
+            Self::bump_dispute_ttl(&env, &dispute_id, &d.status);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DISPUTE"),
+                Symbol::new(&env, "VOTE_FINALIZED"),
+            ),
+            (
+                dispute_id,
+                tally.favour_weight,
+                tally.against_weight,
+                favour_wins,
+            ),
+        );
+
+        Ok(())
+    }
+
+    /// Get the current vote tally for a dispute.
+    pub fn get_vote_tally(env: Env, dispute_id: String) -> VoteTally {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeVoteTally(dispute_id))
+            .unwrap_or(VoteTally {
+                favour_weight: 0,
+                against_weight: 0,
+                vote_count: 0,
+            })
     }
 
     pub fn get_dispute(env: Env, dispute_id: String) -> Result<Dispute, Error> {

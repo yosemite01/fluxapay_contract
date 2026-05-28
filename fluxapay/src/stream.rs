@@ -95,6 +95,29 @@ pub enum StreamError {
     ContractPaused = 9,
     /// Stream distributions are locked until the sender approves milestones.
     MilestoneNotApproved = 10,
+    /// Withdrawal already in progress (reentrancy guard).
+    WithdrawalInProgress = 11,
+}
+
+/// Storage key for the per-stream withdrawal reentrancy lock.
+#[contracttype]
+enum WithdrawLockKey {
+    Lock(String),
+}
+
+fn acquire_lock(env: &Env, stream_id: &String) -> Result<(), StreamError> {
+    let key = WithdrawLockKey::Lock(stream_id.clone());
+    if env.storage().temporary().has(&key) {
+        return Err(StreamError::WithdrawalInProgress);
+    }
+    env.storage().temporary().set(&key, &true);
+    Ok(())
+}
+
+fn release_lock(env: &Env, stream_id: &String) {
+    env.storage()
+        .temporary()
+        .remove(&WithdrawLockKey::Lock(stream_id.clone()));
 }
 
 fn require_not_paused(env: &Env) -> Result<(), StreamError> {
@@ -248,6 +271,9 @@ impl PaymentStreaming {
     ///
     /// This lets anyone trigger a withdrawal later, while the recipient
     /// retains control of where funds are routed.
+    ///
+    /// Auth: only the stream's `receiver` may call this (recipient.require_auth()
+    /// + ownership check). Rejects if the stream is not Active.
     pub fn set_stream_destination(
         env: Env,
         recipient: Address,
@@ -262,6 +288,7 @@ impl PaymentStreaming {
             .get(&StreamDataKey::Stream(stream_id.clone()))
             .ok_or(StreamError::StreamNotFound)?;
 
+        // Auth check: caller must be the stream's receiver
         if stream.receiver != recipient {
             return Err(StreamError::Unauthorized);
         }
@@ -569,8 +596,11 @@ impl PaymentStreaming {
                     .persistent()
                     .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
 
+                // Reentrancy guard: lock acquired after state is persisted
+                acquire_lock(&env, &stream_id)?;
                 let token_client = token::Client::new(&env, &stream.token);
                 token_client.transfer(&env.current_contract_address(), &recipient, &withdrawable);
+                release_lock(&env, &stream_id);
 
                 env.events().publish(
                     (
@@ -607,7 +637,6 @@ impl PaymentStreaming {
         }
 
         if !stream.milestones_approved {
-            // Distributions are locked until sender approves milestones.
             return Err(StreamError::MilestoneNotApproved);
         }
 
@@ -615,6 +644,9 @@ impl PaymentStreaming {
             .destination
             .clone()
             .ok_or(StreamError::DestinationNotSet)?;
+
+        // Reentrancy guard: acquire lock before any state mutation or transfer
+        acquire_lock(&env, &stream_id)?;
 
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(stream.last_checkpoint_at);
@@ -648,6 +680,8 @@ impl PaymentStreaming {
 
         let token_client = token::Client::new(&env, &stream.token);
         token_client.transfer(&env.current_contract_address(), &destination, &withdrawable);
+
+        release_lock(&env, &stream_id);
 
         env.events().publish(
             (
